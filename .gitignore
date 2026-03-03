@@ -1,0 +1,5 @@
+recap
+*.exe
+*.pdf
+*.png
+.DS_Store
