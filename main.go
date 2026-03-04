@@ -25,6 +25,8 @@ func main() {
 		cmdPipe()
 	case "grab", "g":
 		cmdGrab()
+	case "detect", "d":
+		cmdDetect()
 	case "screen":
 		cmdScreen()
 	case "snap", "export", "s":
@@ -127,6 +129,8 @@ func printUsage() {
 
   Capture:
     recap                 Record a shell session (PTY wrapper)
+    recap detect          Detect windows → select → capture → PDF
+    recap detect --list   List detected windows with details
     recap grab            Capture scrollback (tmux/clipboard/file)
     recap grab --edit     Capture → open in nvim → trim → render
     recap pipe            Read from stdin, render as PDF
@@ -159,6 +163,15 @@ func printUsage() {
     Ctrl+] then p         Snap → PNG
     Ctrl+] then q         Quit recording
     Ctrl+] Ctrl+]         Send literal Ctrl+]
+
+  Ghostty:
+    Split panes are detected automatically via Accessibility API.
+    Each pane is captured as a separate PDF.
+    Requires: System Settings → Privacy & Security → Accessibility
+
+  Permissions:
+    Screen Recording    Required for window detection and capture
+    Accessibility       Required for Ghostty split pane detection
 
   Version: ` + version + `
 

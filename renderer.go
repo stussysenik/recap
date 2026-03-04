@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"html"
 	"html/template"
 	"os"
 	"os/exec"
@@ -156,6 +158,18 @@ const sessionHTML = `<!DOCTYPE html>
     color: #cdd6f4;
   }
 
+  /* ── Multi-image stacking ── */
+  .content.multi-image {
+    padding: 0;
+  }
+  .content.multi-image img {
+    width: 100%;
+    height: auto;
+    display: block;
+    margin: 0;
+    padding: 0;
+  }
+
   /* ── Print overrides ── */
   @media print {
     body { padding: 16px; }
@@ -253,14 +267,26 @@ func RenderSessionPDF(sess *Session, outputPath string, data []byte) error {
 	if err != nil {
 		return err
 	}
+	return renderHTMLtoPDF(htmlStr, outputPath)
+}
 
+// RenderSessionPNG generates a single continuous PNG screenshot from session data.
+func RenderSessionPNG(sess *Session, outputPath string, data []byte) error {
+	htmlStr, err := buildHTML(sess, data)
+	if err != nil {
+		return err
+	}
+	return renderHTMLtoPNG(htmlStr, outputPath)
+}
+
+// renderHTMLtoPDF renders an HTML string to a PDF file using chromedp.
+func renderHTMLtoPDF(htmlStr, outputPath string) error {
 	htmlPath, cleanup, err := writeHTMLTmp(htmlStr)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	// Ensure output directory exists
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
@@ -304,13 +330,8 @@ func RenderSessionPDF(sess *Session, outputPath string, data []byte) error {
 	return os.WriteFile(outputPath, buf, 0644)
 }
 
-// RenderSessionPNG generates a single continuous PNG screenshot from session data.
-func RenderSessionPNG(sess *Session, outputPath string, data []byte) error {
-	htmlStr, err := buildHTML(sess, data)
-	if err != nil {
-		return err
-	}
-
+// renderHTMLtoPNG renders an HTML string to a PNG file using chromedp.
+func renderHTMLtoPNG(htmlStr, outputPath string) error {
 	htmlPath, cleanup, err := writeHTMLTmp(htmlStr)
 	if err != nil {
 		return err
@@ -348,6 +369,88 @@ func RenderSessionPNG(sess *Session, outputPath string, data []byte) error {
 	}
 
 	return os.WriteFile(outputPath, buf, 0644)
+}
+
+// buildCaptureHTML generates HTML for a CaptureResult (from detect command).
+func buildCaptureHTML(result *CaptureResult) (string, error) {
+	var contentHTML string
+
+	switch result.ContentType {
+	case ContentTextANSI:
+		contentHTML = ANSIToHTML(result.Data)
+	case ContentTextPlain:
+		contentHTML = html.EscapeString(string(result.Data))
+	case ContentScreenshot:
+		b64 := base64.StdEncoding.EncodeToString(result.Data)
+		contentHTML = fmt.Sprintf(
+			`<img src="data:image/png;base64,%s" style="width:100%%;height:auto;display:block;border-radius:4px" />`,
+			b64,
+		)
+	}
+
+	rd := renderData{
+		Title:     result.Title,
+		Content:   template.HTML(contentHTML),
+		Date:      time.Now().Format("2006-01-02 15:04"),
+		Duration:  fmt.Sprintf("%s (%dx%d)", result.Window.Owner, result.Window.Width, result.Window.Height),
+		Directory: result.Window.Name,
+		Version:   version,
+	}
+
+	tmpl, err := template.New("capture").Parse(sessionHTML)
+	if err != nil {
+		return "", fmt.Errorf("parsing template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, rd); err != nil {
+		return "", fmt.Errorf("executing template: %w", err)
+	}
+
+	return buf.String(), nil
+}
+
+// buildMultiImageHTML generates HTML for multiple stacked screenshots (scroll-stitch).
+func buildMultiImageHTML(title string, images [][]byte, w WindowInfo) (string, error) {
+	var contentParts []string
+	for _, img := range images {
+		b64 := base64.StdEncoding.EncodeToString(img)
+		contentParts = append(contentParts,
+			fmt.Sprintf(`<img src="data:image/png;base64,%s" />`, b64))
+	}
+	contentHTML := strings.Join(contentParts, "\n")
+
+	// Wrap in multi-image div
+	contentHTML = fmt.Sprintf(`<div class="content multi-image">%s</div>`, contentHTML)
+
+	// Use a modified template that replaces the .content div
+	rd := renderData{
+		Title:     title,
+		Content:   template.HTML(contentHTML),
+		Date:      time.Now().Format("2006-01-02 15:04"),
+		Duration:  fmt.Sprintf("%d pages captured · %s (%dx%d)", len(images), w.Owner, w.Width, w.Height),
+		Directory: w.Name,
+		Version:   version,
+	}
+
+	// Use the sessionHTML template but replace the content div usage
+	// We need a slightly modified template for multi-image
+	multiImageHTML := strings.Replace(sessionHTML,
+		`<div class="content">{{.Content}}</div>`,
+		`{{.Content}}`,
+		1)
+
+	tmpl, err := template.New("multiimage").Parse(multiImageHTML)
+	if err != nil {
+		return "", fmt.Errorf("parsing template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, rd); err != nil {
+		return "", fmt.Errorf("executing template: %w", err)
+	}
+
+	return buf.String(), nil
 }
 
 // openFile opens a file with the system default application.
