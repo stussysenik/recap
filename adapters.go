@@ -23,6 +23,7 @@ type PaneCapture struct {
 	ContentType ContentType
 	Data        []byte   // single screenshot
 	Images      [][]byte // multi-image (scroll-stitch)
+	SearchText  []byte   // copy/pasteable text extracted from the terminal when available
 	Title       string
 }
 
@@ -31,6 +32,7 @@ type CaptureResult struct {
 	Window      WindowInfo
 	ContentType ContentType
 	Data        []byte
+	SearchText  []byte
 	Title       string
 	Panes       []PaneCapture // non-nil when multi-pane
 }
@@ -90,59 +92,109 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane detection failed: %v, capturing whole window\n", err)
 	}
 
-	// No splits detected — capture whole window
+	// No splits detected — single pane scroll-stitch capture
 	if len(panes) <= 1 {
-		return captureWholeWindow(w)
+		const titleBarHeight = 28
+		fullPane := PaneInfo{
+			Index:  0,
+			X:      0,
+			Y:      titleBarHeight,
+			Width:  w.Width,
+			Height: w.Height - titleBarHeight,
+		}
+
+		searchText, _ := extractGhosttyText(w, fullPane)
+
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scroll-capturing %s...\n", w.Owner)
+		screenshots, scrollErr := scrollStitchCapture(w, fullPane)
+		if scrollErr == nil && len(screenshots) > 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Captured %d page(s)\n", len(screenshots))
+			return &CaptureResult{
+				Window: w,
+				Title:  w.Label(),
+				Panes: []PaneCapture{{
+					Index:       0,
+					ContentType: ContentMultiImage,
+					Images:      screenshots,
+					SearchText:  searchText,
+					Title:       w.Label(),
+				}},
+			}, nil
+		}
+		if scrollErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Scroll capture failed: %v, falling back to screenshot\n", scrollErr)
+		}
+
+		// Fallback: whole window screenshot
+		fallback, err := captureWholeWindow(w)
+		if err == nil {
+			fallback.SearchText = searchText
+			return fallback, nil
+		}
+		if len(searchText) > 0 {
+			return &CaptureResult{
+				Window:      w,
+				ContentType: ContentTextPlain,
+				Data:        searchText,
+				SearchText:  searchText,
+				Title:       w.Label(),
+			}, nil
+		}
+		return nil, err
 	}
 
 	// Filter to selected panes if specified
 	targetPanes := filterSelectedPanes(panes, a.SelectedPanes)
 
-	// Multi-pane: scroll-stitch capture each pane
+	// Multi-pane: scroll-stitch each pane, fallback to screenshot
 	var captures []PaneCapture
 	var failed int
 	for _, pane := range targetPanes {
-		// Try scroll-stitch capture first
-		screenshots, scrollErr := scrollStitchCapture(w, pane)
-		if scrollErr != nil || len(screenshots) == 0 {
-			if scrollErr != nil {
-				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Scroll-stitch failed for pane %d: %v, using viewport\n", pane.Index+1, scrollErr)
-			}
-			// Fallback: single viewport capture
-			screenX := w.X + pane.X
-			screenY := w.Y + pane.Y
-			data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d capture failed: %v\n", pane.Index+1, err)
-				failed++
-				continue
-			}
-			captures = append(captures, PaneCapture{
-				Index:       pane.Index,
-				ContentType: ContentScreenshot,
-				Data:        data,
-				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
-			})
-			continue
-		}
+		searchText, _ := extractGhosttyText(w, pane)
 
-		if len(screenshots) == 1 {
-			// Single screenshot — use regular screenshot type
-			captures = append(captures, PaneCapture{
-				Index:       pane.Index,
-				ContentType: ContentScreenshot,
-				Data:        screenshots[0],
-				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
-			})
-		} else {
-			// Multiple screenshots — use multi-image type
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scroll-capturing pane %d...\n", pane.Index+1)
+		screenshots, scrollErr := scrollStitchCapture(w, pane)
+		if scrollErr == nil && len(screenshots) > 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: %d page(s)\n", pane.Index+1, len(screenshots))
 			captures = append(captures, PaneCapture{
 				Index:       pane.Index,
 				ContentType: ContentMultiImage,
 				Images:      screenshots,
+				SearchText:  searchText,
 				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
 			})
+			continue
 		}
+		if scrollErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d scroll capture failed: %v, using screenshot\n", pane.Index+1, scrollErr)
+		}
+
+		// Fallback: single viewport screenshot
+		screenX := w.X + pane.X
+		screenY := w.Y + pane.Y
+		data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d capture failed: %v\n", pane.Index+1, err)
+			if len(searchText) > 0 {
+				captures = append(captures, PaneCapture{
+					Index:       pane.Index,
+					ContentType: ContentTextPlain,
+					Data:        searchText,
+					SearchText:  searchText,
+					Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+				})
+				continue
+			}
+			failed++
+			continue
+		}
+		captures = append(captures, PaneCapture{
+			Index:       pane.Index,
+			ContentType: ContentScreenshot,
+			Data:        data,
+			SearchText:  searchText,
+			Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+		})
 	}
 
 	// If all pane captures failed, fall back to whole window

@@ -46,12 +46,25 @@ func cmdDetect() {
 	// Select windows
 	var selected []WindowInfo
 	if hasFlag("--all") || hasFlag("-a") {
-		selected = windows
+		for _, w := range windows {
+			if w.Type == AppTerminal {
+				selected = append(selected, w)
+			}
+		}
 	} else {
 		selected = runSelector(windows)
 	}
 	if len(selected) == 0 {
-		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows selected\n")
+		if hasFlag("--all") || hasFlag("-a") {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No terminal windows found.\n")
+			if others := summarizeWindowTypes(windows); others != "" {
+				fmt.Fprintf(os.Stderr, "        Detected non-terminal windows: %s\n", others)
+			}
+			fmt.Fprintf(os.Stderr, "        Use \033[1mrecap detect --list\033[0m to see all visible windows.\n")
+			fmt.Fprintf(os.Stderr, "        Note: windows on other Spaces or minimized are not visible.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows selected\n")
+		}
 		return
 	}
 
@@ -59,21 +72,32 @@ func cmdDetect() {
 
 	// For Ghostty windows with split panes, show pane selector
 	paneSelections := make(map[int][]int) // windowIdx in selected -> selected pane indices
-	for i, w := range selected {
-		if isGhostty(w.Owner) {
-			panes, _ := detectGhosttyPanes(w)
-			if len(panes) > 1 {
-				fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), w.Label())
-				selectedPanes := runPaneSelector(w, panes)
-				if selectedPanes == nil {
-					fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", w.Label())
-					continue
+	isAllMode := hasFlag("--all") || hasFlag("-a")
+	if !isAllMode {
+		for i, w := range selected {
+			if isGhostty(w.Owner) {
+				panes, _ := detectGhosttyPanes(w)
+				if len(panes) > 1 {
+					fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), w.Label())
+					selectedPanes := runPaneSelector(w, panes)
+					if selectedPanes == nil {
+						fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", w.Label())
+						continue
+					}
+					var indices []int
+					for _, p := range selectedPanes {
+						indices = append(indices, p.Index)
+					}
+					paneSelections[i] = indices
 				}
-				var indices []int
-				for _, p := range selectedPanes {
-					indices = append(indices, p.Index)
+			}
+		}
+	} else {
+		for _, w := range selected {
+			if isGhostty(w.Owner) {
+				if n := countGhosttyPanes(w); n > 1 {
+					fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s (capturing all)\n", n, w.Label())
 				}
-				paneSelections[i] = indices
 			}
 		}
 	}
@@ -157,7 +181,7 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 
 		if pane.ContentType == ContentMultiImage && len(pane.Images) > 0 {
 			// Multi-image scroll-stitch: use dedicated renderer
-			htmlStr, err = buildMultiImageHTML(pane.Title, pane.Images, result.Window)
+			htmlStr, err = buildMultiImageHTML(pane.Title, pane.Images, pane.SearchText, result.Window)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d render failed: %v\n", pane.Index+1, err)
 				continue
@@ -168,6 +192,7 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 				Window:      result.Window,
 				ContentType: pane.ContentType,
 				Data:        pane.Data,
+				SearchText:  pane.SearchText,
 				Title:       pane.Title,
 			}
 			htmlStr, err = buildCaptureHTML(single)
@@ -177,7 +202,10 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 			}
 		}
 
-		suffix := fmt.Sprintf("-pane%d", pane.Index+1)
+		suffix := ""
+		if len(result.Panes) > 1 {
+			suffix = fmt.Sprintf("-pane%d", pane.Index+1)
+		}
 		path, err := renderFromHTML(htmlStr, format, outputBase, suffix, result.Window)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d render failed: %v\n", pane.Index+1, err)
@@ -254,6 +282,20 @@ func renderSingle(result *CaptureResult, format, outputBase, suffix string) (str
 	}
 
 	return outPath, nil
+}
+
+// summarizeWindowTypes returns a comma-separated list of unique non-terminal
+// window owner names from the window list. Returns "" if none.
+func summarizeWindowTypes(windows []WindowInfo) string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, w := range windows {
+		if w.Type != AppTerminal && !seen[w.Owner] {
+			seen[w.Owner] = true
+			names = append(names, w.Owner)
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 // sanitizeFilename makes a string safe for use in filenames.

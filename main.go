@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -27,6 +27,8 @@ func main() {
 		cmdGrab()
 	case "detect", "d":
 		cmdDetect()
+	case "chat":
+		cmdChat()
 	case "screen":
 		cmdScreen()
 	case "snap", "export", "s":
@@ -131,11 +133,12 @@ func printUsage() {
     recap                 Record a shell session (PTY wrapper)
     recap detect          Detect windows → select → capture → PDF
     recap detect --list   List detected windows with details
+    recap chat            Quick Ghostty capture (all panes, no TUI)
     recap grab            Capture scrollback (tmux/clipboard/file)
     recap grab --edit     Capture → open in nvim → trim → render
     recap pipe            Read from stdin, render as PDF
     recap screen          Screenshot terminal window
-    recap screen --pages  Multi-page screenshot capture
+    recap screen --pages  Multi-page screenshot → stitched PDF
 
   Export:
     recap snap            Export last recorded session
@@ -180,9 +183,13 @@ func printUsage() {
 
 // Helpers for simple flag parsing
 func getFlag(prefix string) string {
-	for _, arg := range os.Args[2:] {
+	args := os.Args[2:]
+	for i, arg := range args {
 		if strings.HasPrefix(arg, prefix+"=") {
 			return arg[len(prefix)+1:]
+		}
+		if arg == prefix && i+1 < len(args) {
+			return args[i+1]
 		}
 	}
 	return ""

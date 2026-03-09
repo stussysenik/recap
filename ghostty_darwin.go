@@ -3,10 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"os/exec"
 	"strings"
@@ -242,39 +246,107 @@ func countGhosttyPanes(w WindowInfo) int {
 	return len(panes)
 }
 
-// scrollScript sends keyboard events to a Ghostty process for scrolling.
-// Uses CGEvent.postToPid() to send Shift+PageUp/Down for scrollback navigation.
-// Key codes: PageUp=0x74, PageDown=0x79.
-const scrollScript = `
+// copyScript uses Cmd+A (select all) + Cmd+C (copy) via CGEvent to extract
+// terminal text from a Ghostty window through the macOS clipboard.
+// It saves and restores the previous clipboard content.
+const copyScript = `
+import Cocoa
 import CoreGraphics
 import Foundation
 
 let pid = pid_t(Int32(CommandLine.arguments[1])!)
-let action = CommandLine.arguments[2]
 
-func sendKey(_ keyCode: CGKeyCode, shift: Bool) {
+// Save current clipboard
+let pb = NSPasteboard.general
+let saved = pb.string(forType: .string)
+
+// Clear clipboard so we can detect if Cmd+C actually worked
+pb.clearContents()
+
+// Send Cmd+A (select all) — key code 0x00 = 'A'
+func sendCmd(_ keyCode: CGKeyCode) {
     let src = CGEventSource(stateID: .hidSystemState)
     let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)!
     let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)!
-    if shift {
-        down.flags = .maskShift
-        up.flags = .maskShift
-    }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
     down.postToPid(pid)
     up.postToPid(pid)
 }
 
-switch action {
-case "top":
-    for _ in 0..<300 { sendKey(0x74, shift: true); usleep(3000) }
-case "pagedown":
-    sendKey(0x79, shift: true)
-case "bottom":
-    for _ in 0..<300 { sendKey(0x79, shift: true); usleep(3000) }
-default:
-    break
+sendCmd(0x00) // Cmd+A
+usleep(100_000) // 100ms
+
+sendCmd(0x08) // Cmd+C
+usleep(200_000) // 200ms
+
+// Read clipboard
+let text = pb.string(forType: .string) ?? ""
+
+// If clipboard is still empty, key events never reached the window
+if text.isEmpty {
+    pb.clearContents()
+    if let saved = saved {
+        pb.setString(saved, forType: .string)
+    }
+    exit(1)
 }
+
+// Restore previous clipboard
+pb.clearContents()
+if let saved = saved {
+    pb.setString(saved, forType: .string)
+}
+
+// Output the text
+print(text)
 `
+
+// extractGhosttyText extracts terminal text from a Ghostty window using
+// clipboard-based extraction (Cmd+A, Cmd+C). Returns the text content.
+func extractGhosttyText(w WindowInfo, pane PaneInfo) ([]byte, error) {
+	// Activate window so key events reach it
+	if err := activateWindow(w.PID); err != nil {
+		return nil, fmt.Errorf("activate window: %w", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// For multi-pane, click to focus the target pane
+	if pane.Index >= 0 && (pane.Width > 0 && pane.Height > 0) {
+		centerX := w.X + pane.X + pane.Width/2
+		centerY := w.Y + pane.Y + pane.Height/2
+		if err := runClickAt(centerX, centerY); err != nil {
+			return nil, fmt.Errorf("focus pane: %w", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "swift", "-e", copyScript, fmt.Sprintf("%d", w.PID))
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("text extraction timed out (10s)")
+		}
+		return nil, fmt.Errorf("text extraction failed: %w", err)
+	}
+
+	text := strings.TrimRight(string(out), "\n")
+	if len(text) == 0 {
+		return nil, fmt.Errorf("no text extracted from clipboard")
+	}
+
+	// Click pane center to deselect text (less intrusive than Escape for TUI apps)
+	if pane.Width > 0 && pane.Height > 0 {
+		cx := w.X + pane.X + pane.Width/2
+		cy := w.Y + pane.Y + pane.Height/2
+		_ = runClickAt(cx, cy) // best-effort
+	}
+
+	return []byte(text), nil
+}
 
 // activateScript brings a Ghostty window to the foreground using both
 // NSRunningApplication.activate() and AX raise. This ensures CGEvent key
@@ -308,19 +380,6 @@ down.post(tap: .cghidEventTap)
 up.post(tap: .cghidEventTap)
 `
 
-// runScrollAction sends a scroll action to a Ghostty process.
-func runScrollAction(pid int, action string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "swift", "-e", scrollScript,
-		fmt.Sprintf("%d", pid), action)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("scroll %s failed: %w (%s)", action, err, string(out))
-	}
-	return nil
-}
-
 // activateWindow brings the Ghostty window for the given PID to the foreground.
 func activateWindow(pid int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -347,72 +406,417 @@ func runClickAt(x, y int) error {
 	return nil
 }
 
-// scrollStitchCapture captures the full scrollback of a pane by scrolling
-// through it and taking screenshots at each page. Returns ordered PNGs.
+// imageHash decodes a PNG and returns a SHA-256 hash of its pixel data.
+// This ignores PNG metadata/compression differences, detecting truly identical images.
+func imageHash(data []byte) [32]byte {
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		// Fallback: hash the raw bytes
+		return sha256.Sum256(data)
+	}
+	b := img.Bounds()
+	h := sha256.New()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r, g, bl, a := img.At(x, y).RGBA()
+			h.Write([]byte{byte(r >> 8), byte(g >> 8), byte(bl >> 8), byte(a >> 8)})
+		}
+	}
+	var result [32]byte
+	copy(result[:], h.Sum(nil))
+	return result
+}
+
+// isBlankImage checks if a PNG is a solid single-color image (e.g. desktop wallpaper).
+// It samples ~100 pixels across the image and checks if they all match the first pixel
+// within a small tolerance.
+func isBlankImage(data []byte) bool {
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return false
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w == 0 || h == 0 {
+		return true
+	}
+
+	// Get reference color from first pixel
+	refR, refG, refB, _ := img.At(b.Min.X, b.Min.Y).RGBA()
+
+	// Sample ~100 pixels spread across the image
+	steps := 10
+	dx := w / steps
+	dy := h / steps
+	if dx < 1 {
+		dx = 1
+	}
+	if dy < 1 {
+		dy = 1
+	}
+
+	const tolerance = 0x0A00 // ~4% of 16-bit color range
+	for sy := b.Min.Y; sy < b.Max.Y; sy += dy {
+		for sx := b.Min.X; sx < b.Max.X; sx += dx {
+			r, g, bl, _ := img.At(sx, sy).RGBA()
+			if diff(r, refR) > tolerance || diff(g, refG) > tolerance || diff(bl, refB) > tolerance {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// diff returns the absolute difference between two uint32 values.
+func diff(a, b uint32) uint32 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// scrollKeyScript sends a Cmd+Key event to a process via CGEvent.
+// Used for Cmd+Home (scroll to top), Cmd+End (scroll to bottom),
+// and Cmd+PageDown (scroll one viewport).
+const scrollKeyScript = `
+import Cocoa
+import CoreGraphics
+
+let pid = pid_t(Int32(CommandLine.arguments[1])!)
+let keyCode = CGKeyCode(UInt16(CommandLine.arguments[2])!)
+
+let src = CGEventSource(stateID: .hidSystemState)
+let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)!
+let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)!
+down.flags = [.maskCommand, .maskNumericPad, .maskSecondaryFn]
+up.flags = [.maskCommand, .maskNumericPad, .maskSecondaryFn]
+down.postToPid(pid)
+up.postToPid(pid)
+`
+
+// Key codes for scroll navigation
+const (
+	keyCodeHome     = 0x73
+	keyCodeEnd      = 0x77
+	keyCodePageDown = 0x79
+)
+
+// sendScrollKey sends a Cmd+Key event to a Ghostty process.
+func sendScrollKey(pid int, keyCode int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "swift", "-e", scrollKeyScript,
+		fmt.Sprintf("%d", pid), fmt.Sprintf("%d", keyCode))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("sendScrollKey failed: %w (%s)", err, string(out))
+	}
+	return nil
+}
+
+// rowHash returns a SHA-256 hash of all RGBA pixel values in a single row.
+func rowHash(img image.Image, y int) [32]byte {
+	b := img.Bounds()
+	h := sha256.New()
+	for x := b.Min.X; x < b.Max.X; x++ {
+		r, g, bl, a := img.At(x, y).RGBA()
+		h.Write([]byte{byte(r >> 8), byte(g >> 8), byte(bl >> 8), byte(a >> 8)})
+	}
+	var result [32]byte
+	copy(result[:], h.Sum(nil))
+	return result
+}
+
+// subImager is implemented by all standard library image types and provides
+// zero-copy cropping via SubImage.
+type subImager interface {
+	SubImage(r image.Rectangle) image.Image
+}
+
+// copyPHYs finds the pHYs chunk in original and splices it into reencoded.
+// PNG chunks are: 4-byte length (big-endian) + 4-byte type + data + 4-byte CRC.
+// The pHYs chunk is inserted right after IHDR (before any IDAT).
+func copyPHYs(original, reencoded []byte) []byte {
+	// PNG signature is 8 bytes
+	const sigLen = 8
+
+	// Find pHYs chunk in original
+	var phys []byte
+	for pos := sigLen; pos+8 <= len(original); {
+		chunkLen := int(binary.BigEndian.Uint32(original[pos : pos+4]))
+		chunkType := string(original[pos+4 : pos+8])
+		totalLen := 4 + 4 + chunkLen + 4 // length + type + data + crc
+		if pos+totalLen > len(original) {
+			break
+		}
+		if chunkType == "pHYs" {
+			phys = original[pos : pos+totalLen]
+			break
+		}
+		pos += totalLen
+	}
+	if phys == nil {
+		return reencoded
+	}
+
+	// Find insertion point in reencoded: right after IHDR
+	pos := sigLen
+	if pos+8 > len(reencoded) {
+		return reencoded
+	}
+	ihdrLen := int(binary.BigEndian.Uint32(reencoded[pos : pos+4]))
+	ihdrEnd := pos + 4 + 4 + ihdrLen + 4
+	if ihdrEnd > len(reencoded) {
+		return reencoded
+	}
+
+	// Build new PNG: signature + IHDR + pHYs + rest
+	var out bytes.Buffer
+	out.Grow(len(reencoded) + len(phys))
+	out.Write(reencoded[:ihdrEnd])
+	out.Write(phys)
+	out.Write(reencoded[ihdrEnd:])
+	return out.Bytes()
+}
+
+// trimOverlap detects overlapping pixel rows between consecutive screenshots
+// and crops them out so the stitched result has no repeated content.
+func trimOverlap(images [][]byte) ([][]byte, error) {
+	if len(images) <= 1 {
+		return images, nil
+	}
+
+	result := [][]byte{images[0]}
+
+	for i := 1; i < len(images); i++ {
+		imgA, err := png.Decode(bytes.NewReader(images[i-1]))
+		if err != nil {
+			result = append(result, images[i])
+			continue
+		}
+		imgB, err := png.Decode(bytes.NewReader(images[i]))
+		if err != nil {
+			result = append(result, images[i])
+			continue
+		}
+
+		boundsA := imgA.Bounds()
+		boundsB := imgB.Bounds()
+		heightA := boundsA.Dy()
+		heightB := boundsB.Dy()
+
+		// Hash bottom half of A
+		startA := heightA / 2
+		hashesA := make([][32]byte, heightA-startA)
+		for y := startA; y < heightA; y++ {
+			hashesA[y-startA] = rowHash(imgA, boundsA.Min.Y+y)
+		}
+
+		// Hash top half of B
+		endB := heightB / 2
+		hashesB := make([][32]byte, endB)
+		for y := 0; y < endB; y++ {
+			hashesB[y] = rowHash(imgB, boundsB.Min.Y+y)
+		}
+
+		// Search for largest overlap (last N rows of A == first N rows of B)
+		maxOverlap := len(hashesA)
+		if len(hashesB) < maxOverlap {
+			maxOverlap = len(hashesB)
+		}
+
+		overlap := 0
+		for n := maxOverlap; n >= 10; n-- {
+			match := true
+			for k := 0; k < n; k++ {
+				if hashesA[len(hashesA)-n+k] != hashesB[k] {
+					match = false
+					break
+				}
+			}
+			if match {
+				overlap = n
+				break
+			}
+		}
+
+		if overlap > 0 {
+			// Crop top `overlap` rows from B
+			si, ok := imgB.(subImager)
+			if !ok {
+				result = append(result, images[i])
+				continue
+			}
+			cropped := si.SubImage(image.Rect(
+				boundsB.Min.X, boundsB.Min.Y+overlap,
+				boundsB.Max.X, boundsB.Max.Y,
+			))
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, cropped); err != nil {
+				result = append(result, images[i])
+				continue
+			}
+			// Preserve DPI metadata (pHYs chunk) from the original PNG
+			result = append(result, copyPHYs(images[i], buf.Bytes()))
+		} else {
+			result = append(result, images[i])
+		}
+	}
+
+	return result, nil
+}
+
+// trimBottomPadding removes a large trailing run of uniform background rows
+// from the final stitched screenshot so the output ends at the last real line.
+func trimBottomPadding(images [][]byte) [][]byte {
+	if len(images) == 0 {
+		return images
+	}
+
+	result := append([][]byte(nil), images...)
+	last := len(result) - 1
+	if cropped, err := cropBottomBlankRows(result[last]); err == nil {
+		result[last] = cropped
+	}
+	return result
+}
+
+// cropBottomBlankRows trims trailing rows that are effectively identical to the
+// bottom-left background color. This targets the empty terminal area that
+// appears after reaching the end of scrollback on the final capture.
+func cropBottomBlankRows(data []byte) ([]byte, error) {
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+
+	b := img.Bounds()
+	if b.Dx() == 0 || b.Dy() == 0 {
+		return data, nil
+	}
+
+	refR, refG, refB, refA := img.At(b.Min.X, b.Max.Y-1).RGBA()
+	trimTop := b.Max.Y
+	blankRows := 0
+
+	for y := b.Max.Y - 1; y >= b.Min.Y; y-- {
+		if !rowMatchesColor(img, y, refR, refG, refB, refA) {
+			break
+		}
+		trimTop = y
+		blankRows++
+	}
+
+	const minBlankRows = 12
+	if blankRows < minBlankRows || trimTop <= b.Min.Y {
+		return data, nil
+	}
+
+	si, ok := img.(subImager)
+	if !ok {
+		return data, nil
+	}
+
+	cropped := si.SubImage(image.Rect(b.Min.X, b.Min.Y, b.Max.X, trimTop))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, cropped); err != nil {
+		return data, nil
+	}
+
+	return copyPHYs(data, buf.Bytes()), nil
+}
+
+func rowMatchesColor(img image.Image, y int, refR, refG, refB, refA uint32) bool {
+	b := img.Bounds()
+	maxMismatches := b.Dx() / 200
+	if maxMismatches < 2 {
+		maxMismatches = 2
+	}
+
+	const tolerance = 0x0800
+	mismatches := 0
+	for x := b.Min.X; x < b.Max.X; x++ {
+		r, g, bl, a := img.At(x, y).RGBA()
+		if diff(r, refR) > tolerance ||
+			diff(g, refG) > tolerance ||
+			diff(bl, refB) > tolerance ||
+			diff(a, refA) > tolerance {
+			mismatches++
+			if mismatches > maxMismatches {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// scrollStitchCapture scrolls through a pane's scrollback, taking a screenshot
+// at each viewport position, and returns all unique screenshots for stitching.
 func scrollStitchCapture(w WindowInfo, pane PaneInfo) ([][]byte, error) {
-	// 0. Activate the Ghostty window (bring to front so key events reach it)
+	// Activate window and focus pane
 	if err := activateWindow(w.PID); err != nil {
-		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Window activation failed: %v (continuing anyway)\n", err)
+		return nil, fmt.Errorf("activate window: %w", err)
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	screenX := w.X + pane.X
-	screenY := w.Y + pane.Y
-
-	// 1. Click to focus the pane
-	centerX := screenX + pane.Width/2
-	centerY := screenY + pane.Height/2
+	// Click pane center to focus
+	centerX := w.X + pane.X + pane.Width/2
+	centerY := w.Y + pane.Y + pane.Height/2
 	if err := runClickAt(centerX, centerY); err != nil {
 		return nil, fmt.Errorf("focus pane: %w", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// 2. Scroll to top
-	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scrolling pane %d to top...\n", pane.Index+1)
-	if err := runScrollAction(w.PID, "top"); err != nil {
+	// Scroll to top (Cmd+Home)
+	if err := sendScrollKey(w.PID, keyCodeHome); err != nil {
 		return nil, fmt.Errorf("scroll to top: %w", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
-	// 3. Capture loop
+	// Capture loop
+	screenX := w.X + pane.X
+	screenY := w.Y + pane.Y
 	var screenshots [][]byte
-	var prevHash [sha256.Size]byte
-	maxPages := 200 // safety limit
+	var prevHash *[32]byte
 
-	for i := 0; i < maxPages; i++ {
-		data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
+	for i := 0; i < 100; i++ {
+		shot, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
 		if err != nil {
-			if len(screenshots) > 0 {
-				break // partial capture is okay
-			}
 			return nil, fmt.Errorf("capture page %d: %w", i+1, err)
 		}
 
-		// Hash to detect duplicate (reached bottom)
-		hash := sha256.Sum256(data)
-		if i > 0 && hash == prevHash {
-			break // same as previous screenshot — we're at the bottom
+		// Skip blank/solid-color frames (desktop wallpaper, transition artifacts)
+		if isBlankImage(shot) {
+			continue
 		}
-		prevHash = hash
 
-		screenshots = append(screenshots, data)
-
-		if i < maxPages-1 {
-			if err := runScrollAction(w.PID, "pagedown"); err != nil {
-				break // can't scroll further
-			}
-			time.Sleep(150 * time.Millisecond)
+		// End detection: if pixel content matches previous, we've hit the bottom
+		h := imageHash(shot)
+		if prevHash != nil && h == *prevHash {
+			break
 		}
+
+		screenshots = append(screenshots, shot)
+		prevHash = &h
+
+		// Scroll down one page (Cmd+PageDown)
+		if err := sendScrollKey(w.PID, keyCodePageDown); err != nil {
+			return nil, fmt.Errorf("scroll page down: %w", err)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 4. Restore scroll position (scroll back to bottom)
-	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Restoring scroll position...\n")
-	_ = runScrollAction(w.PID, "bottom")
+	// Restore: scroll to bottom (Cmd+End)
+	_ = sendScrollKey(w.PID, keyCodeEnd)
 
 	if len(screenshots) == 0 {
 		return nil, fmt.Errorf("no screenshots captured")
 	}
 
-	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Captured %d page(s) for pane %d\n", len(screenshots), pane.Index+1)
-	return screenshots, nil
+	trimmed, err := trimOverlap(screenshots)
+	if err != nil {
+		return nil, err
+	}
+
+	return trimBottomPadding(trimmed), nil
 }

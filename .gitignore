@@ -2,4 +2,8 @@ recap
 *.exe
 *.pdf
 *.png
+!.gitignore
+!docs/
+!docs/screenshots/
+!docs/screenshots/*.png
 .DS_Store

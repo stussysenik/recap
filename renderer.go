@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
 	"html"
 	"html/template"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,8 +37,11 @@ const sessionHTML = `<!DOCTYPE html>
 
   html, body {
     background: #11111b;
+    {{if gt .CanvasWidth 0}}
+    width: {{.CanvasWidth}}px;
+    {{else}}
     width: 100%;
-    min-height: 100%;
+    {{end}}
   }
 
   body {
@@ -46,6 +51,9 @@ const sessionHTML = `<!DOCTYPE html>
       'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', monospace;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
   }
 
   .window {
@@ -57,6 +65,9 @@ const sessionHTML = `<!DOCTYPE html>
       0 4px 6px rgba(0, 0, 0, 0.15),
       0 25px 50px -12px rgba(0, 0, 0, 0.5),
       0 0 120px -40px rgba(137, 180, 250, 0.08);
+    {{if gt .WindowWidth 0}}
+    width: {{.WindowWidth}}px;
+    {{end}}
   }
 
   /* ── Title Bar ── */
@@ -158,16 +169,36 @@ const sessionHTML = `<!DOCTYPE html>
     color: #cdd6f4;
   }
 
-  /* ── Multi-image stacking ── */
+  /* ── Image capture layout ── */
+  .content.image-capture,
   .content.multi-image {
     padding: 0;
+    position: relative;
+    overflow: hidden;
   }
+  .content.image-capture img,
   .content.multi-image img {
     width: 100%;
     height: auto;
     display: block;
     margin: 0;
     padding: 0;
+  }
+  .copy-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    margin: 0;
+    padding: 0;
+    color: rgba(255, 255, 255, 0.01);
+    background: transparent;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    tab-size: 4;
+    font-size: 11px;
+    line-height: 1.65;
+    user-select: text;
   }
 
   /* ── Print overrides ── */
@@ -191,7 +222,7 @@ const sessionHTML = `<!DOCTYPE html>
       <span class="title">{{.Title}}</span>
       <span class="badge">recap</span>
     </div>
-    <div class="content">{{.Content}}</div>
+    <div class="content{{if .ContentClass}} {{.ContentClass}}{{end}}">{{.Content}}</div>
     <div class="footer">
       <div class="meta">
         <span>{{.Date}}</span>
@@ -207,12 +238,37 @@ const sessionHTML = `<!DOCTYPE html>
 </html>`
 
 type renderData struct {
-	Title     string
-	Content   template.HTML
-	Date      string
-	Duration  string
-	Directory string
-	Version   string
+	Title        string
+	Content      template.HTML
+	ContentClass string
+	Date         string
+	Duration     string
+	Directory    string
+	Version      string
+	WindowWidth  int
+	CanvasWidth  int
+}
+
+func pngWidth(data []byte) int {
+	cfg, err := png.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0
+	}
+	return cfg.Width
+}
+
+func canvasWidth(windowWidth int) int {
+	if windowWidth <= 0 {
+		return 0
+	}
+	return windowWidth
+}
+
+func buildSearchTextLayer(searchText []byte) string {
+	if len(searchText) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`<pre class="copy-layer">%s</pre>`, html.EscapeString(string(searchText)))
 }
 
 func buildHTML(sess *Session, data []byte) (string, error) {
@@ -346,7 +402,6 @@ func renderHTMLtoPNG(htmlStr, outputPath string) error {
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
-		chromedp.WindowSize(1200, 800),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -359,9 +414,26 @@ func renderHTMLtoPNG(htmlStr, outputPath string) error {
 	defer cancel()
 
 	var buf []byte
+	var docWidth int64
 	err = chromedp.Run(ctx,
+		chromedp.EmulateViewport(1200, 800, chromedp.EmulateScale(2)),
 		chromedp.Navigate("file://"+htmlPath),
 		chromedp.WaitReady("body"),
+		chromedp.Evaluate(`Math.ceil(Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0))`, &docWidth),
+	)
+	if err != nil {
+		return fmt.Errorf("rendering PNG: %w", err)
+	}
+
+	if docWidth < 1 {
+		docWidth = 1200
+	}
+	if docWidth > 12000 {
+		docWidth = 12000
+	}
+
+	err = chromedp.Run(ctx,
+		chromedp.EmulateViewport(docWidth, 800, chromedp.EmulateScale(2)),
 		chromedp.FullScreenshot(&buf, 100),
 	)
 	if err != nil {
@@ -374,6 +446,8 @@ func renderHTMLtoPNG(htmlStr, outputPath string) error {
 // buildCaptureHTML generates HTML for a CaptureResult (from detect command).
 func buildCaptureHTML(result *CaptureResult) (string, error) {
 	var contentHTML string
+	var contentClass string
+	var windowWidth int
 
 	switch result.ContentType {
 	case ContentTextANSI:
@@ -382,19 +456,25 @@ func buildCaptureHTML(result *CaptureResult) (string, error) {
 		contentHTML = html.EscapeString(string(result.Data))
 	case ContentScreenshot:
 		b64 := base64.StdEncoding.EncodeToString(result.Data)
+		contentClass = "image-capture"
+		windowWidth = pngWidth(result.Data)
 		contentHTML = fmt.Sprintf(
-			`<img src="data:image/png;base64,%s" style="width:100%%;height:auto;display:block;border-radius:4px" />`,
+			`<img src="data:image/png;base64,%s" />%s`,
 			b64,
+			buildSearchTextLayer(result.SearchText),
 		)
 	}
 
 	rd := renderData{
-		Title:     result.Title,
-		Content:   template.HTML(contentHTML),
-		Date:      time.Now().Format("2006-01-02 15:04"),
-		Duration:  fmt.Sprintf("%s (%dx%d)", result.Window.Owner, result.Window.Width, result.Window.Height),
-		Directory: result.Window.Name,
-		Version:   version,
+		Title:        result.Title,
+		Content:      template.HTML(contentHTML),
+		ContentClass: contentClass,
+		Date:         time.Now().Format("2006-01-02 15:04"),
+		Duration:     fmt.Sprintf("%s (%dx%d)", result.Window.Owner, result.Window.Width, result.Window.Height),
+		Directory:    result.Window.Name,
+		Version:      version,
+		WindowWidth:  windowWidth,
+		CanvasWidth:  canvasWidth(windowWidth),
 	}
 
 	tmpl, err := template.New("capture").Parse(sessionHTML)
@@ -411,36 +491,29 @@ func buildCaptureHTML(result *CaptureResult) (string, error) {
 }
 
 // buildMultiImageHTML generates HTML for multiple stacked screenshots (scroll-stitch).
-func buildMultiImageHTML(title string, images [][]byte, w WindowInfo) (string, error) {
+func buildMultiImageHTML(title string, images [][]byte, searchText []byte, w WindowInfo) (string, error) {
 	var contentParts []string
 	for _, img := range images {
 		b64 := base64.StdEncoding.EncodeToString(img)
 		contentParts = append(contentParts,
 			fmt.Sprintf(`<img src="data:image/png;base64,%s" />`, b64))
 	}
-	contentHTML := strings.Join(contentParts, "\n")
+	contentHTML := strings.Join(contentParts, "\n") + buildSearchTextLayer(searchText)
+	windowWidth := pngWidth(images[0])
 
-	// Wrap in multi-image div
-	contentHTML = fmt.Sprintf(`<div class="content multi-image">%s</div>`, contentHTML)
-
-	// Use a modified template that replaces the .content div
 	rd := renderData{
-		Title:     title,
-		Content:   template.HTML(contentHTML),
-		Date:      time.Now().Format("2006-01-02 15:04"),
-		Duration:  fmt.Sprintf("%d pages captured · %s (%dx%d)", len(images), w.Owner, w.Width, w.Height),
-		Directory: w.Name,
-		Version:   version,
+		Title:        title,
+		Content:      template.HTML(contentHTML),
+		ContentClass: "multi-image",
+		Date:         time.Now().Format("2006-01-02 15:04"),
+		Duration:     fmt.Sprintf("%d pages captured · %s (%dx%d)", len(images), w.Owner, w.Width, w.Height),
+		Directory:    w.Name,
+		Version:      version,
+		WindowWidth:  windowWidth,
+		CanvasWidth:  canvasWidth(windowWidth),
 	}
 
-	// Use the sessionHTML template but replace the content div usage
-	// We need a slightly modified template for multi-image
-	multiImageHTML := strings.Replace(sessionHTML,
-		`<div class="content">{{.Content}}</div>`,
-		`{{.Content}}`,
-		1)
-
-	tmpl, err := template.New("multiimage").Parse(multiImageHTML)
+	tmpl, err := template.New("multiimage").Parse(sessionHTML)
 	if err != nil {
 		return "", fmt.Errorf("parsing template: %w", err)
 	}

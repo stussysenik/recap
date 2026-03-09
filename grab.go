@@ -224,16 +224,56 @@ func cmdScreenPages() {
 		return
 	}
 
-	// For now, just output individual pages. Image stitching can be added later.
-	outputDir := filepath.Join(home, "Desktop", fmt.Sprintf("recap-pages-%s", ts))
-	os.MkdirAll(outputDir, 0755)
-
-	for i, p := range pages {
-		dst := filepath.Join(outputDir, fmt.Sprintf("page-%03d.png", i+1))
-		data, _ := os.ReadFile(p)
-		os.WriteFile(dst, data, 0644)
+	// Read all page images
+	var images [][]byte
+	for _, p := range pages {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Failed to read page: %v\n", err)
+			continue
+		}
+		images = append(images, data)
 	}
 
-	fmt.Fprintf(os.Stderr, "\033[32m✓\033[0m %d pages saved to %s\n", len(pages), outputDir)
-	openFile(outputDir)
+	if len(images) == 0 {
+		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m failed to read captured pages\n")
+		os.Exit(1)
+	}
+
+	// Determine output format and path
+	format := "pdf"
+	if hasFlag("--png") {
+		format = "png"
+	}
+	outputPath := getFlag("--output")
+	if outputPath == "" {
+		outputPath = getFlag("-o")
+	}
+	if outputPath == "" {
+		outputPath = filepath.Join(home, "Desktop",
+			fmt.Sprintf("recap-pages-%s.%s", ts, format))
+	}
+
+	// Build stitched HTML from all page images
+	w := WindowInfo{Owner: "screen", Name: "multi-page capture"}
+	htmlStr, err := buildMultiImageHTML("recap — multi-page capture", images, nil, w)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m building HTML: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Stitching %d pages into %s...\n", len(images), format)
+
+	if format == "png" {
+		err = renderHTMLtoPNG(htmlStr, outputPath)
+	} else {
+		err = renderHTMLtoPDF(htmlStr, outputPath)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m rendering: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "\033[32m✓\033[0m %s\n", outputPath)
+	openFile(outputPath)
 }
