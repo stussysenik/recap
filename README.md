@@ -44,7 +44,13 @@ Terminal output as beautiful PDFs. Capture any terminal — windows, tmux panes,
 ```bash
 git clone https://github.com/stussysenik/recap.git
 cd recap
-go build -o recap .
+make install
+```
+
+This installs `recap` to `~/.local/bin/`. To install elsewhere:
+
+```bash
+make install PREFIX=/usr/local    # requires sudo
 ```
 
 Requires Go 1.21+ and macOS (uses macOS-specific APIs for window detection and capture).
