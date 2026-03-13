@@ -86,7 +86,13 @@ func cmdDetect() {
 	if hasFlag("--all") || hasFlag("-a") {
 		selected = items
 	} else {
-		selected = runDetectSelector(items)
+		// Find active item for pre-selection
+		activeIdx := findActiveItem(items)
+		if activeIdx >= 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pre-selected: %s\n",
+				items[activeIdx].Label())
+		}
+		selected = runDetectSelector(items, activeIdx)
 	}
 	if len(selected) == 0 {
 		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No items selected\n")
@@ -103,7 +109,7 @@ func cmdDetect() {
 			panes, _ := detectGhosttyPanes(*item.Window)
 			if len(panes) > 1 {
 				fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), item.Window.Label())
-				selectedPanes := runPaneSelector(*item.Window, panes)
+				selectedPanes := runPaneSelector(*item.Window, panes, -1) // No pre-selection for panes yet
 				if selectedPanes == nil {
 					fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", item.Window.Label())
 					continue
@@ -356,6 +362,47 @@ func summarizeWindowTypes(windows []WindowInfo) string {
 		}
 	}
 	return strings.Join(names, ", ")
+}
+
+// findActiveItem returns the index of the item that should be pre-selected.
+// Returns -1 if no active item is detected.
+func findActiveItem(items []DetectItem) int {
+	// Priority 1: cmux surface where recap is running (Here flag)
+	for i, d := range items {
+		if d.Cmux != nil && d.Cmux.Here {
+			return i
+		}
+	}
+
+	// Priority 2: active cmux surface
+	for i, d := range items {
+		if d.Cmux != nil && d.Cmux.Active {
+			return i
+		}
+	}
+
+	// Priority 3: active tmux pane
+	for i, d := range items {
+		if d.Tmux != nil && d.Tmux.Active {
+			return i
+		}
+	}
+
+	// Priority 4: frontmost window
+	for i, d := range items {
+		if d.Window != nil && d.Window.IsActive {
+			return i
+		}
+	}
+
+	// Priority 5: first on-screen terminal window
+	for i, d := range items {
+		if d.Window != nil && d.Window.OnScreen && d.Window.Type == AppTerminal {
+			return i
+		}
+	}
+
+	return -1 // no active item found
 }
 
 // sanitizeFilename makes a string safe for use in filenames.

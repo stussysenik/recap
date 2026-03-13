@@ -43,7 +43,8 @@ type WindowInfo struct {
 	Height   int     `json:"height"`
 	X        int     `json:"x"`
 	Y        int     `json:"y"`
-	OnScreen bool   `json:"onscreen"`
+	OnScreen bool    `json:"onscreen"`
+	IsActive bool    `json:"is_active"` // whether this is the frontmost window
 }
 
 // Label returns a display string for the selector.
@@ -56,7 +57,11 @@ func (w WindowInfo) Label() string {
 	if len(name) > 60 {
 		name = name[:57] + "..."
 	}
-	return fmt.Sprintf("%s — %s", strings.ToLower(w.Owner), name)
+	label := fmt.Sprintf("%s — %s", strings.ToLower(w.Owner), name)
+	if w.IsActive {
+		label += " \033[35m(this window)\033[0m" // magenta badge
+	}
+	return label
 }
 
 // swiftScript uses Swift to call CGWindowListCopyWindowInfo for CGWindowIDs.
@@ -149,6 +154,46 @@ for (var i = 0; i < procs.length; i++) {
 JSON.stringify(result);
 `
 
+// getActivePID returns the PID of the frontmost (active) application.
+// Returns -1 if no frontmost app could be determined.
+func getActivePID() int {
+	script := `import Cocoa
+let workspace = NSWorkspace.shared
+if let app = workspace.frontmostApplication {
+    print(app.processIdentifier)
+} else {
+    print(-1)
+}`
+	cmd := exec.Command("swift", "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+	var pid int
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid)
+	return pid
+}
+
+// getFrontmostAppName returns the name of the frontmost (active) application.
+// Returns empty string if no frontmost app could be determined.
+func getFrontmostAppName() string {
+	script := `import Cocoa
+let workspace = NSWorkspace.shared
+if let app = workspace.frontmostApplication {
+    print(app.localizedName ?? "")
+} else {
+    print("")
+}`
+	cmd := exec.Command("swift", "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // listWindows enumerates ALL application windows on macOS, including windows
 // on other Spaces, minimized, and fullscreen. Uses Swift for CGWindowIDs
 // (needed for screencapture -l) and System Events for window names.
@@ -173,7 +218,11 @@ func listWindows() ([]WindowInfo, error) {
 		return nil, fmt.Errorf("parsing window list: %w", err)
 	}
 
-	// Step 2: Enrich with window names from System Events (keyed by PID)
+	// Step 2: Get frontmost app for active window detection
+	activePID := getActivePID()
+	activeAppName := getFrontmostAppName()
+
+	// Step 3: Enrich with window names from System Events (keyed by PID)
 	names := getWindowNames()
 	for i := range windows {
 		windows[i].Type = classifyApp(windows[i].Owner)
@@ -185,12 +234,19 @@ func listWindows() ([]WindowInfo, error) {
 				windows[i].Name = n
 			}
 		}
+
+		// Mark frontmost window as active (match by PID or app name)
+		if activePID > 0 && windows[i].PID == activePID {
+			windows[i].IsActive = true
+		} else if activeAppName != "" && strings.EqualFold(windows[i].Owner, activeAppName) {
+			windows[i].IsActive = true
+		}
 	}
 
-	// Step 3: Deduplicate — same PID → keep largest window
+	// Step 4: Deduplicate — same PID → keep largest window
 	windows = deduplicateWindows(windows)
 
-	// Step 4: Sort — on-screen first, then terminals first
+	// Step 5: Sort — on-screen first, then terminals first
 	sortWindows(windows)
 
 	return windows, nil

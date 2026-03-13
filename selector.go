@@ -10,7 +10,8 @@ import (
 
 // runDetectSelector displays an interactive TUI for selecting from a mixed list
 // of windows and tmux panes. Returns the selected items, or nil if cancelled.
-func runDetectSelector(items []DetectItem) []DetectItem {
+// preSelectedIdx is the index of the item to pre-select, or -1 for no pre-selection.
+func runDetectSelector(items []DetectItem, preSelectedIdx int) []DetectItem {
 	if len(items) == 0 {
 		return nil
 	}
@@ -105,11 +106,28 @@ func runDetectSelector(items []DetectItem) []DetectItem {
 	}
 
 	selected := make(map[int]bool) // itemIdx -> selected
+
+	// Pre-select the active item if specified
+	if preSelectedIdx >= 0 && preSelectedIdx < len(items) {
+		selected[preSelectedIdx] = true
+	}
+
 	cursor := 0
 
-	// Move cursor to first selectable item
-	for cursor < len(entries) && entries[cursor].isHeader {
-		cursor++
+	// Position cursor on pre-selected item, or first selectable item
+	if preSelectedIdx >= 0 {
+		// Find entry index for this item
+		for i, e := range entries {
+			if !e.isHeader && e.itemIdx == preSelectedIdx {
+				cursor = i
+				break
+			}
+		}
+	} else {
+		// Original behavior: first selectable item
+		for cursor < len(entries) && entries[cursor].isHeader {
+			cursor++
+		}
 	}
 
 	// Enter raw mode
@@ -260,7 +278,8 @@ func runDetectSelector(items []DetectItem) []DetectItem {
 
 // runPaneSelector displays an interactive TUI for selecting which panes to capture.
 // Returns the selected panes, or nil if cancelled.
-func runPaneSelector(w WindowInfo, panes []PaneInfo) []PaneInfo {
+// preSelectedIdx is the index of the pane to pre-select, or -1 for no pre-selection.
+func runPaneSelector(w WindowInfo, panes []PaneInfo, preSelectedIdx int) []PaneInfo {
 	if len(panes) == 0 {
 		return nil
 	}
@@ -278,7 +297,18 @@ func runPaneSelector(w WindowInfo, panes []PaneInfo) []PaneInfo {
 	}
 
 	selected := make(map[int]bool) // paneIdx -> selected
+
+	// Pre-select the specified pane if valid
+	if preSelectedIdx >= 0 && preSelectedIdx < len(panes) {
+		selected[panes[preSelectedIdx].Index] = true
+	}
+
 	cursor := 0
+
+	// Position cursor on pre-selected pane if specified
+	if preSelectedIdx >= 0 && preSelectedIdx < len(items) {
+		cursor = preSelectedIdx
+	}
 
 	// Enter raw mode
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
@@ -532,8 +562,12 @@ func renderDetectList(windows []WindowInfo, tmuxPanes []TmuxPane, cmuxSurfaces [
 			if !w.OnScreen {
 				onscreen = " \033[90m(other space)\033[0m"
 			}
-			fmt.Printf("    \033[33m[screenshot]\033[0m \033[90m[%d]\033[0m %s \033[90m\u2014 %s\033[0m (%dx%d @%d,%d)%s%s\n",
-				w.ID, strings.ToLower(w.Owner), name, w.Width, w.Height, w.X, w.Y, extra, onscreen)
+			active := ""
+			if w.IsActive {
+				active = " \033[35m(this window)\033[0m"
+			}
+			fmt.Printf("    \033[33m[screenshot]\033[0m \033[90m[%d]\033[0m %s \033[90m\u2014 %s\033[0m (%dx%d @%d,%d)%s%s%s\n",
+				w.ID, strings.ToLower(w.Owner), name, w.Width, w.Height, w.X, w.Y, extra, onscreen, active)
 		}
 		fmt.Println()
 	}
