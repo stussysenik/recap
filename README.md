@@ -1,160 +1,111 @@
-# recap
+```
+  ┌──────────────────────────────────────────────────┐
+  │  ◉ recap — terminal output as beautiful PDFs     │
+  └──────────────────────────────────────────────────┘
+```
 
-Terminal output as beautiful PDFs. Capture any terminal — windows, tmux panes, cmux workspaces, or raw sessions — and render them as Catppuccin Mocha themed PDFs with full ANSI color support.
+capture any terminal — windows, tmux panes, cmux workspaces, or raw sessions — and render them as themed PDFs with full ANSI color support. one binary, no dependencies, works with what you already use.
 
-## Features
-
-- **Record** — PTY-based session recording with in-session snap shortcuts
-- **Detect** — Discover all terminal windows, tmux panes, and cmux workspaces automatically
-- **Grab** — Capture scrollback from tmux, clipboard, or files
-- **Pipe** — Render any stdin stream as a PDF or PNG
-- **Screen** — Screenshot terminal windows with multi-page stitching
-- **Claude** — Render Claude Code JSONL conversation logs
-
-## Capture Sources
-
-| Source | Method | Output |
-|--------|--------|--------|
-| Terminal windows | Screenshot via macOS APIs | PDF/PNG |
-| Ghostty split panes | Accessibility API per-pane capture | PDF/PNG per pane |
-| tmux panes | `tmux capture-pane` with ANSI | PDF/PNG |
-| cmux workspaces | `cmux read-screen` full scrollback | PDF/PNG (text) |
-| PTY recording | Live session capture | PDF/PNG |
-| stdin | Pipe any text/ANSI stream | PDF/PNG |
-
-## Supported Terminals
-
-- Ghostty (including split pane detection)
-- iTerm2
-- Terminal.app
-- Alacritty
-- Kitty
-- WezTerm
-- Any terminal window visible to macOS
-
-## Supported Browsers
-
-- Safari
-- Chrome / Chromium
-- Firefox
-- Arc
-
-## Installation
+## quick start
 
 ```bash
 git clone https://github.com/stussysenik/recap.git
-cd recap
-make install
+cd recap && make install
+recap
 ```
 
-This installs `recap` to `~/.local/bin/`. To install elsewhere:
+## what it captures
 
-```bash
-make install PREFIX=/usr/local    # requires sudo
+**windows & panes**
+```
+recap                    record a shell session (PTY wrapper)
+recap detect             detect windows → select → capture → PDF
+recap detect --list      list detected windows with details
+recap chat               quick Ghostty capture (all panes, no TUI)
+recap screen             screenshot terminal window
+recap screen --pages     multi-page screenshot → stitched PDF
 ```
 
-Requires Go 1.21+ and macOS (uses macOS-specific APIs for window detection and capture).
-
-## Usage
-
-### Record a session
-
-```bash
-recap                    # Start recording (PTY wrapper)
-# Ctrl+] then s         # Snap to PDF during recording
-# Ctrl+] then q         # Quit recording
+**sessions & scrollback**
+```
+recap grab               capture scrollback (tmux/clipboard/file)
+recap grab --edit        capture → open in $EDITOR → trim → render
+recap grab --from=tmux   tmux scrollback with ANSI colors
+recap grab --from=clipboard   macOS clipboard (pbpaste)
+recap grab --from=<file>      read from file
 ```
 
-### Detect and capture
-
-```bash
-recap detect             # Discover windows → interactive TUI → capture → PDF
-recap detect --list      # List all detected windows, tmux panes, cmux workspaces
+**export**
+```
+recap snap               export last recorded session
+recap snap --png         export as PNG instead of PDF
+recap list               list recorded sessions
 ```
 
-### Grab scrollback
+## pipe everything
 
 ```bash
-recap grab               # Auto-detect source (tmux/clipboard)
-recap grab --from=tmux   # Capture tmux scrollback with ANSI colors
-recap grab --edit        # Capture → open in $EDITOR → trim → render
-```
-
-### Pipe input
-
-```bash
-pbpaste | recap pipe                        # Clipboard → PDF
-cat session.log | recap pipe                # File → PDF
+pbpaste | recap pipe                        # clipboard → PDF
+cat session.log | recap pipe                # file → PDF
 tmux capture-pane -pS- -e | recap pipe      # tmux → PDF
-command 2>&1 | recap pipe --png             # Command output → PNG
+command 2>&1 | recap pipe --png             # command → PNG
 ```
 
-### Screenshot
+## in-session shortcuts
+
+during `recap` recording:
+
+```
+Ctrl+] then s         snap → PDF
+Ctrl+] then p         snap → PNG
+Ctrl+] then q         quit recording
+Ctrl+] Ctrl+]         send literal Ctrl+]
+```
+
+## plays nice with
+
+**Ghostty** — split panes detected automatically via Accessibility API. each pane captured as a separate PDF.
+
+**tmux** — all sessions and panes discovered automatically. scrollback captured with full ANSI color sequences preserved.
+
+**cmux** — workspaces and surfaces discovered via socket at `/tmp/cmux.sock`. full scrollback text capture — no screenshot stitching needed.
+
+**Claude Code** — `recap claude` renders JSONL conversation logs with role-based formatting (Human/Assistant/Tool).
+
+## terminals
+
+Ghostty · iTerm2 · Terminal.app · Alacritty · Kitty · WezTerm · any window visible to macOS
+
+## flags
+
+```
+--png              output PNG instead of PDF
+--output=PATH      custom output path
+--edit, -e         open in $EDITOR before rendering
+--title=TEXT       custom header title
+```
+
+## install
 
 ```bash
-recap screen             # Screenshot terminal window
-recap screen --pages     # Multi-page screenshot capture
+git clone https://github.com/stussysenik/recap.git
+cd recap && make install
 ```
 
-### Claude Code logs
+installs to `~/.local/bin/`. for a different prefix:
 
 ```bash
-recap claude             # Render latest Claude Code conversation
+make install PREFIX=/usr/local
 ```
 
-### Export and list
+requires Go 1.21+ and macOS.
 
-```bash
-recap snap               # Export last recorded session
-recap snap --png         # Export as PNG instead of PDF
-recap list               # List all recorded sessions
-```
+> **permissions** — recap needs Screen Recording (for window detection) and Accessibility (for Ghostty split panes). grant in System Settings → Privacy & Security.
 
-## Flags
+## output
 
-```
---png              Output PNG instead of PDF
---output=PATH      Custom output path
---edit, -e         Open in $EDITOR before rendering
---title=TEXT       Custom header title
-```
+all output uses the **Catppuccin Mocha** color theme — full 256-color and truecolor ANSI, monospace rendering, automatic page breaks, timestamped headers.
 
-## Permissions
+---
 
-recap requires the following macOS permissions:
-
-- **Screen Recording** — Required for window detection and screenshot capture
-- **Accessibility** — Required for Ghostty split pane detection via AX API
-
-Grant these in: System Settings → Privacy & Security
-
-## Integrations
-
-### Ghostty
-
-Split panes are detected automatically via the Accessibility API. Each pane is captured as a separate PDF with its own content.
-
-### tmux
-
-All tmux sessions and panes are discovered automatically. Scrollback is captured with full ANSI color sequences preserved.
-
-### cmux
-
-Workspaces and surfaces are discovered via the cmux socket (`/tmp/cmux.sock`). Full scrollback text is captured directly — no screenshot stitching needed.
-
-### Claude Code
-
-Claude Code JSONL conversation logs are parsed and rendered with role-based formatting (Human/Assistant/Tool).
-
-## Output
-
-All output uses the **Catppuccin Mocha** color theme with:
-
-- Full 256-color and truecolor ANSI support
-- Monospace font rendering (JetBrains Mono / system monospace)
-- Automatic page breaks for long output
-- Header with title, timestamp, and source info
-
-## License
-
-MIT
+v0.3.1 · MIT
