@@ -19,7 +19,7 @@ func cmdDetect() {
 		outputPath = getFlag("-o")
 	}
 
-	// Detect all visible windows
+	// Detect all windows (across all Spaces, minimized, fullscreen)
 	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Detecting windows...\n")
 
 	windows, err := listWindows()
@@ -30,74 +30,89 @@ func cmdDetect() {
 		os.Exit(1)
 	}
 
-	if len(windows) == 0 {
-		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No visible windows found.\n")
-		fmt.Fprintf(os.Stderr, "        Are your windows visible (not minimized)?\n")
+	// Discover tmux panes (auto-detect if tmux server is running)
+	tmuxPanes := listTmuxPanes()
+	if len(tmuxPanes) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d tmux pane(s)\n", len(tmuxPanes))
+	}
+
+	// Discover cmux surfaces (auto-detect via socket)
+	cmuxSurfaces := listCmuxSurfaces()
+	if len(cmuxSurfaces) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d cmux surface(s) across %d workspace(s)\n",
+			len(cmuxSurfaces), countCmuxWorkspaces(cmuxSurfaces))
+	}
+
+	// When cmux surfaces are found, filter out the opaque cmux window from
+	// the window list — individual surfaces replace it with richer access.
+	if len(cmuxSurfaces) > 0 {
+		var filtered []WindowInfo
+		for _, w := range windows {
+			if strings.Contains(strings.ToLower(w.Owner), "cmux") {
+				continue
+			}
+			filtered = append(filtered, w)
+		}
+		windows = filtered
+	}
+
+	// Build unified detect items
+	var items []DetectItem
+	for i := range cmuxSurfaces {
+		items = append(items, DetectItem{Cmux: &cmuxSurfaces[i]})
+	}
+	for i := range windows {
+		items = append(items, DetectItem{Window: &windows[i]})
+	}
+	for i := range tmuxPanes {
+		items = append(items, DetectItem{Tmux: &tmuxPanes[i]})
+	}
+
+	if len(items) == 0 {
+		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows or tmux panes found.\n")
 		os.Exit(1)
 	}
 
 	// Debug list mode
 	if hasFlag("--list") {
-		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d windows:\n", len(windows))
-		renderWindowList(windows)
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d windows, %d tmux panes, %d cmux surfaces:\n",
+			len(windows), len(tmuxPanes), len(cmuxSurfaces))
+		renderDetectList(windows, tmuxPanes, cmuxSurfaces)
 		return
 	}
 
-	// Select windows
-	var selected []WindowInfo
+	// Select items (windows + tmux panes)
+	var selected []DetectItem
 	if hasFlag("--all") || hasFlag("-a") {
-		for _, w := range windows {
-			if w.Type == AppTerminal {
-				selected = append(selected, w)
-			}
-		}
+		selected = items
 	} else {
-		selected = runSelector(windows)
+		selected = runDetectSelector(items)
 	}
 	if len(selected) == 0 {
-		if hasFlag("--all") || hasFlag("-a") {
-			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No terminal windows found.\n")
-			if others := summarizeWindowTypes(windows); others != "" {
-				fmt.Fprintf(os.Stderr, "        Detected non-terminal windows: %s\n", others)
-			}
-			fmt.Fprintf(os.Stderr, "        Use \033[1mrecap detect --list\033[0m to see all visible windows.\n")
-			fmt.Fprintf(os.Stderr, "        Note: windows on other Spaces or minimized are not visible.\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows selected\n")
-		}
+		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No items selected\n")
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Capturing %d window(s)...\n", len(selected))
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Capturing %d item(s)...\n", len(selected))
 
 	// For Ghostty windows with split panes, show pane selector
-	paneSelections := make(map[int][]int) // windowIdx in selected -> selected pane indices
-	isAllMode := hasFlag("--all") || hasFlag("-a")
-	if !isAllMode {
-		for i, w := range selected {
-			if isGhostty(w.Owner) {
-				panes, _ := detectGhosttyPanes(w)
-				if len(panes) > 1 {
-					fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), w.Label())
-					selectedPanes := runPaneSelector(w, panes)
-					if selectedPanes == nil {
-						fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", w.Label())
-						continue
-					}
-					var indices []int
-					for _, p := range selectedPanes {
-						indices = append(indices, p.Index)
-					}
-					paneSelections[i] = indices
+	// Skip cmux windows — they're decomposed into individual surfaces
+	paneSelections := make(map[int][]int) // index in selected -> selected pane indices
+	for i, item := range selected {
+		if item.Window != nil && isGhostty(item.Window.Owner) && !strings.Contains(strings.ToLower(item.Window.Owner), "cmux") {
+			panes, _ := detectGhosttyPanes(*item.Window)
+			if len(panes) > 1 {
+				fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), item.Window.Label())
+				selectedPanes := runPaneSelector(*item.Window, panes)
+				if selectedPanes == nil {
+					fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", item.Window.Label())
+					continue
 				}
-			}
-		}
-	} else {
-		for _, w := range selected {
-			if isGhostty(w.Owner) {
-				if n := countGhosttyPanes(w); n > 1 {
-					fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s (capturing all)\n", n, w.Label())
+				var indices []int
+				for _, p := range selectedPanes {
+					indices = append(indices, p.Index)
 				}
+				paneSelections[i] = indices
 			}
 		}
 	}
@@ -109,23 +124,36 @@ func cmdDetect() {
 	var results []string
 	var errors []string
 
-	for i, w := range selected {
+	for i, item := range selected {
 		wg.Add(1)
 		selectedPaneIndices := paneSelections[i]
-		go func(win WindowInfo, paneIndices []int) {
+		go func(d DetectItem, paneIndices []int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			paths, err := captureAndRender(win, format, outputPath, paneIndices)
+			var paths []string
+			var err error
+
+			if d.Cmux != nil {
+				// cmux surface: text-based capture via cmux read-screen
+				paths, err = captureAndRenderCmux(*d.Cmux, format, outputPath)
+			} else if d.Tmux != nil {
+				// tmux pane: text-based capture via tmux capture-pane
+				paths, err = captureAndRenderTmux(*d.Tmux, format, outputPath)
+			} else {
+				// Window: screenshot-based capture
+				paths, err = captureAndRender(*d.Window, format, outputPath, paneIndices)
+			}
+
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("%s: %v", win.Owner, err))
+				errors = append(errors, fmt.Sprintf("%s: %v", d.Label(), err))
 			} else {
 				results = append(results, paths...)
 			}
-		}(w, selectedPaneIndices)
+		}(item, selectedPaneIndices)
 	}
 
 	wg.Wait()
@@ -147,8 +175,40 @@ func cmdDetect() {
 	}
 }
 
+// captureAndRenderTmux runs the full pipeline for a tmux pane:
+// tmux capture-pane -> ANSI -> HTML -> PDF/PNG.
+func captureAndRenderTmux(pane TmuxPane, format, outputBase string) ([]string, error) {
+	adapter := &TmuxAdapter{}
+	result, err := adapter.CapturePane(pane)
+	if err != nil {
+		return nil, err
+	}
+
+	path, err := renderSingle(result, format, outputBase, "")
+	if err != nil {
+		return nil, err
+	}
+	return []string{path}, nil
+}
+
+// captureAndRenderCmux runs the full pipeline for a cmux surface:
+// cmux read-screen -> plain text -> HTML -> PDF/PNG.
+func captureAndRenderCmux(surface CmuxSurface, format, outputBase string) ([]string, error) {
+	adapter := &CmuxAdapter{}
+	result, err := adapter.CaptureSurface(surface)
+	if err != nil {
+		return nil, err
+	}
+
+	path, err := renderSingle(result, format, outputBase, "")
+	if err != nil {
+		return nil, err
+	}
+	return []string{path}, nil
+}
+
 // captureAndRender runs the full pipeline for a single window:
-// capture → build HTML → render to PDF/PNG.
+// capture -> build HTML -> render to PDF/PNG.
 // Returns multiple paths when a window has split panes.
 // paneIndices controls which panes to capture for Ghostty (nil = all).
 func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int) ([]string, error) {

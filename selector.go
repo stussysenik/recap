@@ -8,37 +8,75 @@ import (
 	"golang.org/x/term"
 )
 
-// runSelector displays an interactive TUI for selecting windows.
-// Returns the selected windows, or nil if cancelled.
-func runSelector(windows []WindowInfo) []WindowInfo {
-	if len(windows) == 0 {
+// runDetectSelector displays an interactive TUI for selecting from a mixed list
+// of windows and tmux panes. Returns the selected items, or nil if cancelled.
+func runDetectSelector(items []DetectItem) []DetectItem {
+	if len(items) == 0 {
 		return nil
 	}
 
 	// Pre-scan Ghostty windows for split pane counts
-	paneCounts := make(map[int]int) // windowIdx -> pane count
-	for i, w := range windows {
-		if isGhostty(w.Owner) {
-			if n := countGhosttyPanes(w); n > 1 {
+	paneCounts := make(map[int]int) // itemIdx -> pane count
+	for i, d := range items {
+		if d.Window != nil && isGhostty(d.Window.Owner) {
+			if n := countGhosttyPanes(*d.Window); n > 1 {
 				paneCounts[i] = n
 			}
 		}
 	}
 
-	order := []AppType{AppTerminal, AppBrowser, AppGeneric}
-
 	// Build flat list of selectable items with group headers
-	type item struct {
-		windowIdx int  // -1 for group headers
-		label     string
-		isHeader  bool
+	type entry struct {
+		itemIdx  int  // -1 for group headers
+		label    string
+		isHeader bool
 	}
 
-	var items []item
-	for _, t := range order {
+	var entries []entry
+
+	// Group 0: cmux Workspaces
+	var cmuxEntries []int
+	for i, d := range items {
+		if d.Cmux != nil {
+			cmuxEntries = append(cmuxEntries, i)
+		}
+	}
+	if len(cmuxEntries) > 0 {
+		entries = append(entries, entry{itemIdx: -1, label: "cmux Workspaces:", isHeader: true})
+		for _, idx := range cmuxEntries {
+			s := items[idx].Cmux
+			label := s.Label() + " \033[36m[text]\033[0m"
+			if s.Here {
+				label += " \033[35m(this shell)\033[0m"
+			}
+			entries = append(entries, entry{itemIdx: idx, label: label})
+		}
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
+	}
+
+	// Group 1: tmux Panes
+	var tmuxEntries []int
+	for i, d := range items {
+		if d.Tmux != nil {
+			tmuxEntries = append(tmuxEntries, i)
+		}
+	}
+	if len(tmuxEntries) > 0 {
+		entries = append(entries, entry{itemIdx: -1, label: "tmux Panes:", isHeader: true})
+		for _, idx := range tmuxEntries {
+			pane := items[idx].Tmux
+			label := pane.Label() + " \033[36m[text]\033[0m"
+			entries = append(entries, entry{itemIdx: idx, label: label})
+		}
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
+	}
+
+	// Group 2-4: Windows by type (Terminals, Browsers, Desktop)
+	typeOrder := []AppType{AppTerminal, AppBrowser, AppGeneric}
+	for _, t := range typeOrder {
 		var windowsInGroup []int
-		for i, w := range windows {
-			if w.Type == t {
+		for i, d := range items {
+			if d.Window != nil && d.Window.Type == t {
 				windowsInGroup = append(windowsInGroup, i)
 			}
 		}
@@ -46,27 +84,31 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 			continue
 		}
 
-		items = append(items, item{windowIdx: -1, label: t.String() + "s:", isHeader: true})
+		entries = append(entries, entry{itemIdx: -1, label: t.String() + "s:", isHeader: true})
 		for _, idx := range windowsInGroup {
-			label := windows[idx].Label()
+			w := items[idx].Window
+			label := w.Label() + " \033[33m[screenshot]\033[0m"
+			if !w.OnScreen {
+				label += " \033[90m(other space)\033[0m"
+			}
 			if n, ok := paneCounts[idx]; ok {
 				label = fmt.Sprintf("%s (%d panes)", label, n)
 			}
-			items = append(items, item{windowIdx: idx, label: label})
+			entries = append(entries, entry{itemIdx: idx, label: label})
 		}
-		items = append(items, item{windowIdx: -1, label: "", isHeader: true}) // spacer
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
 	}
 
 	// Remove trailing spacer
-	if len(items) > 0 && items[len(items)-1].isHeader && items[len(items)-1].label == "" {
-		items = items[:len(items)-1]
+	if len(entries) > 0 && entries[len(entries)-1].isHeader && entries[len(entries)-1].label == "" {
+		entries = entries[:len(entries)-1]
 	}
 
-	selected := make(map[int]bool) // windowIdx -> selected
+	selected := make(map[int]bool) // itemIdx -> selected
 	cursor := 0
 
 	// Move cursor to first selectable item
-	for cursor < len(items) && items[cursor].isHeader {
+	for cursor < len(entries) && entries[cursor].isHeader {
 		cursor++
 	}
 
@@ -88,16 +130,16 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 
 		// Header
 		fmt.Print("  \033[1;38;5;105m\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\033[0m\r\n")
-		fmt.Print("  \033[1;38;5;105m\u2502\033[0m  \033[1;97m\u25c9 recap detect\033[0m \033[90m\u2014 select windows\033[0m               \033[1;38;5;105m\u2502\033[0m\r\n")
+		fmt.Print("  \033[1;38;5;105m\u2502\033[0m  \033[1;97m\u25c9 recap detect\033[0m \033[90m\u2014 select targets\033[0m              \033[1;38;5;105m\u2502\033[0m\r\n")
 		fmt.Print("  \033[1;38;5;105m\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\033[0m\r\n")
 		fmt.Print("\r\n")
 
-		for i, it := range items {
-			if it.isHeader {
-				if it.label == "" {
+		for i, e := range entries {
+			if e.isHeader {
+				if e.label == "" {
 					fmt.Print("\r\n")
 				} else {
-					fmt.Printf("  \033[1;93m%s\033[0m\r\n", it.label)
+					fmt.Printf("  \033[1;93m%s\033[0m\r\n", e.label)
 				}
 				continue
 			}
@@ -108,11 +150,11 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 			}
 
 			check := "[ ]"
-			if selected[it.windowIdx] {
+			if selected[e.itemIdx] {
 				check = "\033[32m[x]\033[0m"
 			}
 
-			label := it.label
+			label := e.label
 			if i == cursor {
 				label = "\033[1;97m" + label + "\033[0m"
 			} else {
@@ -136,12 +178,12 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 		for {
 			cursor += delta
 			if cursor < 0 {
-				cursor = len(items) - 1
+				cursor = len(entries) - 1
 			}
-			if cursor >= len(items) {
+			if cursor >= len(entries) {
 				cursor = 0
 			}
-			if !items[cursor].isHeader {
+			if !entries[cursor].isHeader {
 				break
 			}
 		}
@@ -174,8 +216,8 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 			case 'j': // vim down
 				moveCursor(1)
 			case ' ': // toggle selection
-				if cursor < len(items) && !items[cursor].isHeader {
-					idx := items[cursor].windowIdx
+				if cursor < len(entries) && !entries[cursor].isHeader {
+					idx := entries[cursor].itemIdx
 					if selected[idx] {
 						delete(selected, idx)
 					} else {
@@ -186,9 +228,9 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 				if len(selected) > 0 {
 					selected = make(map[int]bool)
 				} else {
-					for _, it := range items {
-						if !it.isHeader {
-							selected[it.windowIdx] = true
+					for _, e := range entries {
+						if !e.isHeader {
+							selected[e.itemIdx] = true
 						}
 					}
 				}
@@ -196,9 +238,9 @@ func runSelector(windows []WindowInfo) []WindowInfo {
 				if len(selected) == 0 {
 					break
 				}
-				var result []WindowInfo
+				var result []DetectItem
 				for idx := range selected {
-					result = append(result, windows[idx])
+					result = append(result, items[idx])
 				}
 				// Clear screen before returning
 				fmt.Print("\033[2J\033[H")
@@ -231,7 +273,7 @@ func runPaneSelector(w WindowInfo, panes []PaneInfo) []PaneInfo {
 	var items []item
 	for _, p := range panes {
 		hint := panePositionHint(p, panes)
-		label := fmt.Sprintf("Pane %d — %s (%dx%d)", p.Index+1, hint, p.Width, p.Height)
+		label := fmt.Sprintf("Pane %d \u2014 %s (%dx%d)", p.Index+1, hint, p.Width, p.Height)
 		items = append(items, item{paneIdx: p.Index, label: label})
 	}
 
@@ -424,10 +466,41 @@ func groupLabel(t AppType) string {
 	}
 }
 
-// renderWindowList prints a non-interactive window list (for --list flag).
-func renderWindowList(windows []WindowInfo) {
+// renderDetectList prints a non-interactive list of windows, tmux panes, and cmux surfaces (for --list flag).
+func renderDetectList(windows []WindowInfo, tmuxPanes []TmuxPane, cmuxSurfaces []CmuxSurface) {
 	fmt.Println()
 
+	// cmux surfaces
+	if len(cmuxSurfaces) > 0 {
+		fmt.Printf("  \033[1;93mcmux Workspaces:\033[0m\n")
+		for _, s := range cmuxSurfaces {
+			badge := ""
+			if s.Active {
+				badge = " \033[32m*active\033[0m"
+			}
+			if s.Here {
+				badge += " \033[35m(this shell)\033[0m"
+			}
+			fmt.Printf("    \033[36m[text]\033[0m %s%s\n", s.Label(), badge)
+		}
+		fmt.Println()
+	}
+
+	// tmux panes
+	if len(tmuxPanes) > 0 {
+		fmt.Printf("  \033[1;93mtmux Panes:\033[0m\n")
+		for _, p := range tmuxPanes {
+			active := ""
+			if p.Active {
+				active = " \033[32m*active\033[0m"
+			}
+			fmt.Printf("    \033[36m[text]\033[0m %s \033[90m(%dx%d)\033[0m%s\n",
+				p.Label(), p.Width, p.Height, active)
+		}
+		fmt.Println()
+	}
+
+	// Windows by type
 	typeOrder := []AppType{AppTerminal, AppBrowser, AppGeneric}
 	for _, t := range typeOrder {
 		var group []WindowInfo
@@ -455,8 +528,12 @@ func renderWindowList(windows []WindowInfo) {
 					extra = fmt.Sprintf(" \033[36m(%d panes)\033[0m", n)
 				}
 			}
-			fmt.Printf("    \033[90m[%d]\033[0m %s \033[90m— %s\033[0m (%dx%d @%d,%d)%s\n",
-				w.ID, strings.ToLower(w.Owner), name, w.Width, w.Height, w.X, w.Y, extra)
+			onscreen := ""
+			if !w.OnScreen {
+				onscreen = " \033[90m(other space)\033[0m"
+			}
+			fmt.Printf("    \033[33m[screenshot]\033[0m \033[90m[%d]\033[0m %s \033[90m\u2014 %s\033[0m (%dx%d @%d,%d)%s%s\n",
+				w.ID, strings.ToLower(w.Owner), name, w.Width, w.Height, w.X, w.Y, extra, onscreen)
 		}
 		fmt.Println()
 	}

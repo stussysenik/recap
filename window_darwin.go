@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -33,15 +34,16 @@ func (t AppType) String() string {
 
 // WindowInfo describes a visible window on screen.
 type WindowInfo struct {
-	ID     int     `json:"id"`
-	Owner  string  `json:"owner"`
-	Name   string  `json:"name"`
-	PID    int     `json:"pid"`
-	Type   AppType `json:"-"`
-	Width  int     `json:"width"`
-	Height int     `json:"height"`
-	X      int     `json:"x"`
-	Y      int     `json:"y"`
+	ID       int     `json:"id"`
+	Owner    string  `json:"owner"`
+	Name     string  `json:"name"`
+	PID      int     `json:"pid"`
+	Type     AppType `json:"-"`
+	Width    int     `json:"width"`
+	Height   int     `json:"height"`
+	X        int     `json:"x"`
+	Y        int     `json:"y"`
+	OnScreen bool   `json:"onscreen"`
 }
 
 // Label returns a display string for the selector.
@@ -58,41 +60,64 @@ func (w WindowInfo) Label() string {
 }
 
 // swiftScript uses Swift to call CGWindowListCopyWindowInfo for CGWindowIDs.
+// Uses .optionAll to discover windows across ALL Spaces, minimized, and fullscreen.
 // Swift has direct CoreGraphics access unlike JXA which has bridging issues.
 const swiftScript = `
 import CoreGraphics
 import Foundation
 
-let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+// .optionAll finds windows on all Spaces, minimized, and fullscreen
+let allOptions: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+guard let windowList = CGWindowListCopyWindowInfo(allOptions, kCGNullWindowID) as? [[String: Any]] else {
     print("[]")
     exit(0)
 }
 
+// Also query on-screen-only to know which windows are currently visible
+let onScreenOptions: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+let onScreenList = CGWindowListCopyWindowInfo(onScreenOptions, kCGNullWindowID) as? [[String: Any]] ?? []
+var onScreenIDs = Set<Int>()
+for w in onScreenList {
+    if let wid = w["kCGWindowNumber"] as? Int { onScreenIDs.insert(wid) }
+}
+
 var result: [[String: Any]] = []
-let skip = Set(["Dock", "SystemUIServer", "Control Center", "WindowManager", "Notification Center", "Window Server"])
+let skip = Set(["dock", "systemuiserver", "control center", "windowmanager", "notification center", "window server",
+                 "autofill", "loginwindow", "open and save panel service", "universalaccessauthwarn",
+                 "bzbmenu", "simulator"])
 
 for w in windowList {
     let layer = w["kCGWindowLayer"] as? Int ?? 0
     guard layer == 0 else { continue }
 
     let owner = w["kCGWindowOwnerName"] as? String ?? ""
-    guard !skip.contains(owner), !owner.isEmpty else { continue }
+    guard !skip.contains(owner.lowercased()), !owner.isEmpty else { continue }
+
+    // Filter out invisible/daemon windows (alpha == 0)
+    let alpha = w["kCGWindowAlpha"] as? Double ?? 1.0
+    guard alpha > 0 else { continue }
+
+    // Filter out windows that are not normal (e.g. utility panels)
+    let storeType = w["kCGWindowStoreType"] as? Int ?? 1
+    guard storeType != 0 else { continue }
 
     let bounds = w["kCGWindowBounds"] as? [String: Any] ?? [:]
     let width = Int(bounds["Width"] as? Double ?? Double(bounds["Width"] as? Int ?? 0))
     let height = Int(bounds["Height"] as? Double ?? Double(bounds["Height"] as? Int ?? 0))
     guard width >= 100, height >= 100 else { continue }
 
+    let windowID = w["kCGWindowNumber"] as? Int ?? 0
+
     result.append([
-        "id": w["kCGWindowNumber"] as? Int ?? 0,
+        "id": windowID,
         "owner": owner,
         "name": w["kCGWindowName"] as? String ?? "",
         "pid": w["kCGWindowOwnerPID"] as? Int ?? 0,
         "width": width,
         "height": height,
         "x": Int(bounds["X"] as? Double ?? 0),
-        "y": Int(bounds["Y"] as? Double ?? 0)
+        "y": Int(bounds["Y"] as? Double ?? 0),
+        "onscreen": onScreenIDs.contains(windowID)
     ])
 }
 
@@ -105,7 +130,7 @@ print(String(data: json, encoding: .utf8)!)
 // but System Events can get them with just Accessibility permission.
 const jxaWindowNames = `
 var se = Application("System Events");
-var procs = se.processes.whose({visible: true, backgroundOnly: false})();
+var procs = se.processes.whose({backgroundOnly: false})();
 var result = {};
 for (var i = 0; i < procs.length; i++) {
   var proc = procs[i];
@@ -124,9 +149,9 @@ for (var i = 0; i < procs.length; i++) {
 JSON.stringify(result);
 `
 
-// listWindows enumerates all visible application windows on macOS.
-// Uses Swift for CGWindowIDs (needed for screencapture -l) and
-// System Events for window names (doesn't require Screen Recording permission).
+// listWindows enumerates ALL application windows on macOS, including windows
+// on other Spaces, minimized, and fullscreen. Uses Swift for CGWindowIDs
+// (needed for screencapture -l) and System Events for window names.
 func listWindows() ([]WindowInfo, error) {
 	// Step 1: Get window IDs via Swift/CoreGraphics
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -162,7 +187,55 @@ func listWindows() ([]WindowInfo, error) {
 		}
 	}
 
+	// Step 3: Deduplicate — same PID → keep largest window
+	windows = deduplicateWindows(windows)
+
+	// Step 4: Sort — on-screen first, then terminals first
+	sortWindows(windows)
+
 	return windows, nil
+}
+
+// deduplicateWindows keeps the largest window per PID to avoid showing
+// multiple entries for the same application (e.g. off-screen duplicates).
+func deduplicateWindows(windows []WindowInfo) []WindowInfo {
+	best := make(map[int]int) // PID → index of largest window
+	for i, w := range windows {
+		area := w.Width * w.Height
+		if existing, ok := best[w.PID]; ok {
+			existingArea := windows[existing].Width * windows[existing].Height
+			if area > existingArea {
+				best[w.PID] = i
+			}
+		} else {
+			best[w.PID] = i
+		}
+	}
+
+	var result []WindowInfo
+	seen := make(map[int]bool)
+	for _, w := range windows {
+		idx := best[w.PID]
+		if seen[w.PID] {
+			continue
+		}
+		seen[w.PID] = true
+		result = append(result, windows[idx])
+	}
+	return result
+}
+
+// sortWindows orders windows: on-screen first, then terminals before
+// browsers before generic apps.
+func sortWindows(windows []WindowInfo) {
+	sort.SliceStable(windows, func(i, j int) bool {
+		// On-screen windows come first
+		if windows[i].OnScreen != windows[j].OnScreen {
+			return windows[i].OnScreen
+		}
+		// Terminals first, then browsers, then generic
+		return windows[i].Type < windows[j].Type
+	})
 }
 
 // getWindowNames fetches window titles via System Events AppleScript.

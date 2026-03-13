@@ -42,6 +42,36 @@ type CaptureAdapter interface {
 	Capture(w WindowInfo) (*CaptureResult, error)
 }
 
+// DetectItem is a union type representing either a window, a tmux pane,
+// or a cmux surface discovered during detection. Exactly one field is non-nil.
+type DetectItem struct {
+	Window *WindowInfo
+	Tmux   *TmuxPane
+	Cmux   *CmuxSurface
+}
+
+// Label returns a display string for the selector.
+func (d DetectItem) Label() string {
+	if d.Cmux != nil {
+		return d.Cmux.Label()
+	}
+	if d.Tmux != nil {
+		return d.Tmux.Label()
+	}
+	return d.Window.Label()
+}
+
+// CaptureMethod returns "text" for tmux/cmux, "screenshot" for windows.
+func (d DetectItem) CaptureMethod() string {
+	if d.Cmux != nil {
+		return "text"
+	}
+	if d.Tmux != nil {
+		return "text"
+	}
+	return "screenshot"
+}
+
 // adapterFor returns the appropriate capture adapter for a window.
 func adapterFor(w WindowInfo) CaptureAdapter {
 	switch w.Type {
@@ -55,6 +85,55 @@ func adapterFor(w WindowInfo) CaptureAdapter {
 	default:
 		return &GenericAdapter{}
 	}
+}
+
+// TmuxAdapter captures tmux pane content via `tmux capture-pane`.
+// Produces ANSI text content that flows through ANSIToHTML → chromedp → PDF.
+type TmuxAdapter struct{}
+
+func (a *TmuxAdapter) CapturePane(pane TmuxPane) (*CaptureResult, error) {
+	data, err := captureTmuxPane(pane.PaneID)
+	if err != nil {
+		return nil, fmt.Errorf("tmux capture: %w", err)
+	}
+
+	// Build a synthetic WindowInfo for the rendering pipeline
+	win := WindowInfo{
+		Owner:    "tmux",
+		Name:     pane.Label(),
+		OnScreen: true,
+	}
+
+	return &CaptureResult{
+		Window:      win,
+		ContentType: ContentTextANSI,
+		Data:        data,
+		Title:       pane.Label(),
+	}, nil
+}
+
+// CmuxAdapter captures cmux surface content via `cmux read-screen`.
+// Produces plain text content that flows through html.EscapeString → chromedp → PDF.
+type CmuxAdapter struct{}
+
+func (a *CmuxAdapter) CaptureSurface(surface CmuxSurface) (*CaptureResult, error) {
+	data, err := captureCmuxSurface(surface.WorkspaceRef, surface.SurfaceRef)
+	if err != nil {
+		return nil, fmt.Errorf("cmux capture: %w", err)
+	}
+
+	win := WindowInfo{
+		Owner:    "cmux",
+		Name:     surface.Label(),
+		OnScreen: true,
+	}
+
+	return &CaptureResult{
+		Window:      win,
+		ContentType: ContentTextPlain,
+		Data:        data,
+		Title:       surface.Label(),
+	}, nil
 }
 
 // isGhostty checks if a window owner is Ghostty or cmux (Ghostty multiplexer).

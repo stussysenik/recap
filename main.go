@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -171,6 +171,11 @@ func printUsage() {
     Split panes are detected automatically via Accessibility API.
     Each pane is captured as a separate PDF.
     Requires: System Settings → Privacy & Security → Accessibility
+
+  Cmux:
+    Workspaces and surfaces are discovered automatically via socket.
+    Full scrollback text capture — no screenshot stitching needed.
+    Requires: cmux running with socket at /tmp/cmux.sock
 
   Permissions:
     Screen Recording    Required for window detection and capture

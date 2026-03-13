@@ -302,6 +302,49 @@ if let saved = saved {
 print(text)
 `
 
+// scrollScript sends keyboard events to a Ghostty process for scrolling.
+// Uses CGEvent.postToPid() for key events.
+// Key codes: Home=0x73, End=0x77, PageUp=0x74, PageDown=0x79.
+// "top" tries Cmd+Home first (instant jump), falls back to 500x Shift+PageUp.
+const scrollScript = `
+import CoreGraphics
+import Foundation
+
+let pid = pid_t(Int32(CommandLine.arguments[1])!)
+let action = CommandLine.arguments[2]
+
+func sendKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)!
+    let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)!
+    if !flags.isEmpty {
+        down.flags = flags
+        up.flags = flags
+    }
+    down.postToPid(pid)
+    up.postToPid(pid)
+}
+
+switch action {
+case "top":
+    // Try Cmd+Home for instant scroll-to-top
+    sendKey(0x73, flags: .maskCommand)
+    usleep(50000) // 50ms
+    // Also send 500x Shift+PageUp as fallback (Ghostty may not support Cmd+Home)
+    for _ in 0..<500 { sendKey(0x74, flags: .maskShift); usleep(5000) }
+case "pagedown":
+    sendKey(0x79, flags: .maskShift)
+case "bottom":
+    // Try Cmd+End for instant scroll-to-bottom
+    sendKey(0x77, flags: .maskCommand)
+    usleep(50000) // 50ms
+    // Fallback: 500x Shift+PageDown
+    for _ in 0..<500 { sendKey(0x79, flags: .maskShift); usleep(5000) }
+default:
+    break
+}
+`
+
 // extractGhosttyText extracts terminal text from a Ghostty window using
 // clipboard-based extraction (Cmd+A, Cmd+C). Returns the text content.
 func extractGhosttyText(w WindowInfo, pane PaneInfo) ([]byte, error) {
@@ -402,6 +445,19 @@ func runClickAt(x, y int) error {
 		fmt.Sprintf("%d", x), fmt.Sprintf("%d", y))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("click failed: %w (%s)", err, string(out))
+	}
+	return nil
+}
+
+// runScrollAction sends a scroll action to a Ghostty process.
+func runScrollAction(pid int, action string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "swift", "-e", scrollScript,
+		fmt.Sprintf("%d", pid), action)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("scroll %s failed: %w (%s)", action, err, string(out))
 	}
 	return nil
 }
@@ -750,68 +806,103 @@ func rowMatchesColor(img image.Image, y int, refR, refG, refB, refA uint32) bool
 	return true
 }
 
-// scrollStitchCapture scrolls through a pane's scrollback, taking a screenshot
-// at each viewport position, and returns all unique screenshots for stitching.
+// scrollStitchCapture captures the full scrollback of a pane by scrolling
+// through it and taking screenshots at each page. Returns ordered PNGs.
 func scrollStitchCapture(w WindowInfo, pane PaneInfo) ([][]byte, error) {
-	// Activate window and focus pane
+	// Activate the Ghostty window (bring to front so key events reach it)
 	if err := activateWindow(w.PID); err != nil {
-		return nil, fmt.Errorf("activate window: %w", err)
+		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Window activation failed: %v (continuing anyway)\n", err)
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// Click pane center to focus
-	centerX := w.X + pane.X + pane.Width/2
-	centerY := w.Y + pane.Y + pane.Height/2
+	screenX := w.X + pane.X
+	screenY := w.Y + pane.Y
+
+	// Click to focus the pane
+	centerX := screenX + pane.Width/2
+	centerY := screenY + pane.Height/2
 	if err := runClickAt(centerX, centerY); err != nil {
 		return nil, fmt.Errorf("focus pane: %w", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Scroll to top (Cmd+Home)
-	if err := sendScrollKey(w.PID, keyCodeHome); err != nil {
+	// Scroll to top
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scrolling pane %d to top...\n", pane.Index+1)
+	if err := runScrollAction(w.PID, "top"); err != nil {
 		return nil, fmt.Errorf("scroll to top: %w", err)
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Capture loop
-	screenX := w.X + pane.X
-	screenY := w.Y + pane.Y
-	var screenshots [][]byte
-	var prevHash *[32]byte
-
-	for i := 0; i < 100; i++ {
-		shot, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
+	// Stability check: take screenshots until 2 consecutive frames match
+	// This confirms rendering has settled after scroll-to-top.
+	var stableHash [sha256.Size]byte
+	for stabilityCheck := 0; stabilityCheck < 10; stabilityCheck++ {
+		data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
 		if err != nil {
+			break
+		}
+		hash := sha256.Sum256(data)
+		if stabilityCheck > 0 && hash == stableHash {
+			break // rendering settled
+		}
+		stableHash = hash
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Capture loop
+	var screenshots [][]byte
+	var prevHash [sha256.Size]byte
+	var matchCount int // consecutive identical hash count
+	maxPages := 200    // safety limit
+
+	for i := 0; i < maxPages; i++ {
+		data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
+		if err != nil {
+			if len(screenshots) > 0 {
+				break // partial capture is okay
+			}
 			return nil, fmt.Errorf("capture page %d: %w", i+1, err)
 		}
 
 		// Skip blank/solid-color frames (desktop wallpaper, transition artifacts)
-		if isBlankImage(shot) {
+		if isBlankImage(data) {
 			continue
 		}
 
-		// End detection: if pixel content matches previous, we've hit the bottom
-		h := imageHash(shot)
-		if prevHash != nil && h == *prevHash {
-			break
+		// Hash to detect duplicate (reached bottom)
+		// Require 2 consecutive identical hashes to prevent premature stop
+		// from render glitches or partial frame captures.
+		hash := sha256.Sum256(data)
+		if i > 0 && hash == prevHash {
+			matchCount++
+			if matchCount >= 2 {
+				break // 2 consecutive identical screenshots — confirmed at bottom
+			}
+			time.Sleep(300 * time.Millisecond)
+			continue
 		}
+		matchCount = 0
+		prevHash = hash
 
-		screenshots = append(screenshots, shot)
-		prevHash = &h
+		screenshots = append(screenshots, data)
 
-		// Scroll down one page (Cmd+PageDown)
-		if err := sendScrollKey(w.PID, keyCodePageDown); err != nil {
-			return nil, fmt.Errorf("scroll page down: %w", err)
+		if i < maxPages-1 {
+			if err := runScrollAction(w.PID, "pagedown"); err != nil {
+				break // can't scroll further
+			}
+			time.Sleep(300 * time.Millisecond)
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Restore: scroll to bottom (Cmd+End)
-	_ = sendScrollKey(w.PID, keyCodeEnd)
+	// Restore scroll position (scroll back to bottom)
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Restoring scroll position...\n")
+	_ = runScrollAction(w.PID, "bottom")
 
 	if len(screenshots) == 0 {
 		return nil, fmt.Errorf("no screenshots captured")
 	}
+
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Captured %d page(s) for pane %d\n", len(screenshots), pane.Index+1)
 
 	trimmed, err := trimOverlap(screenshots)
 	if err != nil {
