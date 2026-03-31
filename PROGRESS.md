@@ -1,5 +1,36 @@
 # recap — Progress Log
 
+## v0.4.0 — PNG Optimization & Window Targeting
+
+### Direct PNG Stitching (Chrome bypass)
+- Scroll-captured screenshots now stitch directly in Go via `image/png` + `image/draw`
+- Eliminates Chrome dependency for PNG output entirely
+- Previously: Chrome rendered base64-embedded HTML → timeout at 30s for large captures
+- Now: direct pixel stitching, no intermediate HTML or base64 encoding
+
+### Median-Cut Color Quantization
+- Implements Heckbert (1982) median-cut algorithm for optimal 256-color palette
+- Samples 25% of pixels across all pages for histogram
+- Floyd-Steinberg dithering for smooth anti-aliased terminal text
+- Output: 8-bit indexed palette PNG instead of 32-bit RGBA
+- Result: **15MB for 12 Retina pages** (was 231MB with naive RGBA for 200 pages)
+
+### BestCompression PNG Encoder
+- Replaced `png.Encode()` (default compression) with `png.Encoder{CompressionLevel: png.BestCompression}`
+- Applied to both direct stitching path and Chrome rendering fallback
+
+### Precise Window Targeting
+- `--window-id N` — target exact macOS window ID (from `detect --list`)
+- `--title PATTERN` — substring match on window title
+- `--pane N` — capture only pane N (1-indexed)
+- Interactive picker when multiple Ghostty windows found (no more silent first-window selection)
+- Error messages list available windows with IDs for quick retargeting
+
+### Scaled Chrome Timeout (PDF path)
+- Timeout scales with HTML content size: `30s base + 15s per MB`
+- Capped at 5 minutes
+- Prevents "context canceled" on large multi-page PDF renders
+
 ## v0.3.1 — cmux Native Integration
 
 - Discover cmux workspaces and surfaces via `cmux tree --all --json`
