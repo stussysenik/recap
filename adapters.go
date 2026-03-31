@@ -42,12 +42,39 @@ type CaptureAdapter interface {
 	Capture(w WindowInfo) (*CaptureResult, error)
 }
 
-// DetectItem is a union type representing either a window, a tmux pane,
-// or a cmux surface discovered during detection. Exactly one field is non-nil.
+// DetectItem is a union type representing a capturable target discovered
+// during detection. Exactly one field is non-nil. Extended to support
+// individual terminal tabs, Kitty panes, and orphan TTY sessions.
 type DetectItem struct {
-	Window *WindowInfo
-	Tmux   *TmuxPane
-	Cmux   *CmuxSurface
+	Window   *WindowInfo
+	Tmux     *TmuxPane
+	Cmux     *CmuxSurface
+	Tab      *TabItem       // AX-detected tab within a terminal window
+	Kitty    *KittyPaneItem // Kitty pane discovered via socket protocol
+	TTYShell *TTYShellItem  // Orphan shell on a TTY (no window correlation)
+}
+
+// TabItem represents a single tab detected via AXTabGroup.
+// Links back to the parent window for capture purposes.
+type TabItem struct {
+	ParentWindow WindowInfo // the terminal window this tab belongs to
+	AXTab        AXTab      // tab metadata from Accessibility API
+}
+
+// KittyPaneItem represents a single Kitty pane with its rich metadata
+// and the socket path needed for capture.
+type KittyPaneItem struct {
+	Pane       KittyPane
+	SocketPath string
+	TabTitle   string // title of the parent tab
+}
+
+// TTYShellItem represents a shell process on a TTY that couldn't be
+// correlated to any known terminal window. Typically SSH sessions,
+// screen sessions, or terminals we lack window info for.
+type TTYShellItem struct {
+	Shell   ShellProc
+	Session *ShellSession // optional enrichment from shell hook registry
 }
 
 // Label returns a display string for the selector.
@@ -58,16 +85,61 @@ func (d DetectItem) Label() string {
 	if d.Tmux != nil {
 		return d.Tmux.Label()
 	}
+	if d.Tab != nil {
+		title := d.Tab.AXTab.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		return fmt.Sprintf("%s — tab %d: %s", strings.ToLower(d.Tab.ParentWindow.Owner), d.Tab.AXTab.Tab+1, title)
+	}
+	if d.Kitty != nil {
+		title := d.Kitty.Pane.Title
+		if title == "" {
+			title = d.Kitty.Pane.ForegroundProcess()
+		}
+		if title == "" {
+			title = "(shell)"
+		}
+		cwd := d.Kitty.Pane.CWD
+		if cwd != "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				cwd = strings.Replace(cwd, home, "~", 1)
+			}
+			return fmt.Sprintf("kitty: %s — %s", title, cwd)
+		}
+		return fmt.Sprintf("kitty: %s", title)
+	}
+	if d.TTYShell != nil {
+		s := d.TTYShell
+		label := fmt.Sprintf("%s (PID %d, %s)", s.Shell.Comm, s.Shell.PID, s.Shell.TTY)
+		if s.Session != nil && s.Session.CWD != "" {
+			cwd := s.Session.CWD
+			if home, err := os.UserHomeDir(); err == nil {
+				cwd = strings.Replace(cwd, home, "~", 1)
+			}
+			label += fmt.Sprintf(" — %s", cwd)
+		}
+		return label
+	}
 	return d.Window.Label()
 }
 
-// CaptureMethod returns "text" for tmux/cmux, "screenshot" for windows.
+// CaptureMethod returns "text" for tmux/cmux/kitty/tty, "screenshot" for windows.
 func (d DetectItem) CaptureMethod() string {
 	if d.Cmux != nil {
 		return "text"
 	}
 	if d.Tmux != nil {
 		return "text"
+	}
+	if d.Kitty != nil {
+		return "text"
+	}
+	if d.TTYShell != nil {
+		return "text"
+	}
+	if d.Tab != nil {
+		return "screenshot"
 	}
 	return "screenshot"
 }
@@ -452,4 +524,44 @@ func extractBrowserURL(owner string) string {
 func runAppleScript(script string) ([]byte, error) {
 	cmd := exec.Command("osascript", "-e", script)
 	return cmd.Output()
+}
+
+// KittyAdapter captures Kitty pane content via the remote control socket.
+// Produces ANSI text content from the pane's scrollback.
+type KittyAdapter struct{}
+
+func (a *KittyAdapter) CaptureKittyPane(pane KittyPaneItem) (*CaptureResult, error) {
+	data, err := kittyGetText(pane.SocketPath, pane.Pane.ID)
+	if err != nil {
+		return nil, fmt.Errorf("kitty capture: %w", err)
+	}
+
+	title := pane.Pane.Title
+	if title == "" {
+		title = pane.Pane.ForegroundProcess()
+	}
+	if pane.Pane.CWD != "" {
+		cwd := pane.Pane.CWD
+		if home, err := os.UserHomeDir(); err == nil {
+			cwd = strings.Replace(cwd, home, "~", 1)
+		}
+		if title != "" {
+			title = fmt.Sprintf("kitty: %s — %s", title, cwd)
+		} else {
+			title = fmt.Sprintf("kitty: %s", cwd)
+		}
+	}
+
+	win := WindowInfo{
+		Owner:    "kitty",
+		Name:     title,
+		OnScreen: true,
+	}
+
+	return &CaptureResult{
+		Window:      win,
+		ContentType: ContentTextANSI,
+		Data:        data,
+		Title:       title,
+	}, nil
 }

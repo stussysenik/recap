@@ -58,9 +58,12 @@ func TestTrimBottomPaddingAfterOverlap(t *testing.T) {
 func TestBuildMultiImageHTMLIncludesSearchTextAndNativeWidth(t *testing.T) {
 	img := encodeRowImage(t, 8, repeatRow(color.NRGBA{R: 0x22, G: 0x55, B: 0x88, A: 0xff}, 6)...)
 
+	// With WindowInfo.Width set, logical width should be used instead of pngWidth.
 	htmlStr, err := buildMultiImageHTML("ghostty", [][]byte{img}, []byte("copy me"), WindowInfo{
-		Owner: "Ghostty",
-		Name:  "pane",
+		Owner:  "Ghostty",
+		Name:   "pane",
+		Width:  400,
+		Height: 300,
 	})
 	if err != nil {
 		t.Fatalf("buildMultiImageHTML returned error: %v", err)
@@ -72,11 +75,32 @@ func TestBuildMultiImageHTMLIncludesSearchTextAndNativeWidth(t *testing.T) {
 	if !strings.Contains(htmlStr, "copy me") {
 		t.Fatalf("expected search text in rendered HTML")
 	}
-	if !strings.Contains(htmlStr, "width: 8px;") {
-		t.Fatalf("expected native image width in rendered HTML, html=%q", htmlStr)
+	// Should use logical width (400), not pngWidth (8)
+	if !strings.Contains(htmlStr, "width: 400px;") {
+		t.Fatalf("expected logical window width (400px) in rendered HTML, html=%q", htmlStr)
+	}
+	if strings.Contains(htmlStr, "width: 8px;") {
+		t.Fatalf("should not use pngWidth when WindowInfo.Width is set")
 	}
 	if strings.Contains(htmlStr, "min-height: 100%") {
 		t.Fatalf("unexpected fixed min-height in rendered HTML")
+	}
+}
+
+func TestBuildMultiImageHTMLFallsBackToPngWidth(t *testing.T) {
+	img := encodeRowImage(t, 8, repeatRow(color.NRGBA{R: 0x22, G: 0x55, B: 0x88, A: 0xff}, 6)...)
+
+	// With WindowInfo.Width == 0, should fall back to pngWidth
+	htmlStr, err := buildMultiImageHTML("ghostty", [][]byte{img}, nil, WindowInfo{
+		Owner: "Ghostty",
+		Name:  "pane",
+	})
+	if err != nil {
+		t.Fatalf("buildMultiImageHTML returned error: %v", err)
+	}
+
+	if !strings.Contains(htmlStr, "width: 8px;") {
+		t.Fatalf("expected pngWidth fallback (8px) when WindowInfo.Width is 0, html=%q", htmlStr)
 	}
 }
 

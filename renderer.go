@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"os"
+	"sort"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -257,11 +261,19 @@ func pngWidth(data []byte) int {
 	return cfg.Width
 }
 
+func pngSize(data []byte) (int, int) {
+	cfg, err := png.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0
+	}
+	return cfg.Width, cfg.Height
+}
+
 func canvasWidth(windowWidth int) int {
 	if windowWidth <= 0 {
 		return 0
 	}
-	return windowWidth
+	return windowWidth + 64 // 32px body padding × 2 sides
 }
 
 func buildSearchTextLayer(searchText []byte) string {
@@ -359,7 +371,12 @@ func renderHTMLtoPDF(htmlStr, outputPath string) error {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	// Scale timeout with HTML size: 30s base + 15s per MB of content.
+	pdfTimeout := 30 + len(htmlStr)/(1024*1024)*15
+	if pdfTimeout > 300 {
+		pdfTimeout = 300
+	}
+	ctx, cancel = context.WithTimeout(ctx, time.Duration(pdfTimeout)*time.Second)
 	defer cancel()
 
 	var buf []byte
@@ -410,7 +427,12 @@ func renderHTMLtoPNG(htmlStr, outputPath string) error {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	// Scale timeout with HTML size: 30s base + 15s per MB of content.
+	pngTimeout := 30 + len(htmlStr)/(1024*1024)*15
+	if pngTimeout > 300 {
+		pngTimeout = 300
+	}
+	ctx, cancel = context.WithTimeout(ctx, time.Duration(pngTimeout)*time.Second)
 	defer cancel()
 
 	var buf []byte
@@ -419,7 +441,14 @@ func renderHTMLtoPNG(htmlStr, outputPath string) error {
 		chromedp.EmulateViewport(1200, 800, chromedp.EmulateScale(2)),
 		chromedp.Navigate("file://"+htmlPath),
 		chromedp.WaitReady("body"),
-		chromedp.Evaluate(`Math.ceil(Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0))`, &docWidth),
+		chromedp.Evaluate(`(() => {
+			const w = document.querySelector('.window');
+			if (w) return Math.ceil(w.getBoundingClientRect().width) + 64;
+			return Math.ceil(Math.max(
+				document.documentElement.scrollWidth,
+				document.body ? document.body.scrollWidth : 0
+			));
+		})()`, &docWidth),
 	)
 	if err != nil {
 		return fmt.Errorf("rendering PNG: %w", err)
@@ -457,7 +486,11 @@ func buildCaptureHTML(result *CaptureResult) (string, error) {
 	case ContentScreenshot:
 		b64 := base64.StdEncoding.EncodeToString(result.Data)
 		contentClass = "image-capture"
-		windowWidth = pngWidth(result.Data)
+		if result.Window.Width > 0 {
+			windowWidth = result.Window.Width
+		} else {
+			windowWidth = pngWidth(result.Data) // fallback for pipe/stdin
+		}
 		contentHTML = fmt.Sprintf(
 			`<img src="data:image/png;base64,%s" />%s`,
 			b64,
@@ -499,7 +532,10 @@ func buildMultiImageHTML(title string, images [][]byte, searchText []byte, w Win
 			fmt.Sprintf(`<img src="data:image/png;base64,%s" />`, b64))
 	}
 	contentHTML := strings.Join(contentParts, "\n") + buildSearchTextLayer(searchText)
-	windowWidth := pngWidth(images[0])
+	windowWidth := w.Width
+	if windowWidth <= 0 {
+		windowWidth = pngWidth(images[0]) // fallback
+	}
 
 	rd := renderData{
 		Title:        title,
@@ -524,6 +560,165 @@ func buildMultiImageHTML(title string, images [][]byte, searchText []byte, w Win
 	}
 
 	return buf.String(), nil
+}
+
+// stitchImagesPNG directly stitches multiple PNG screenshots into a single PNG file.
+// This bypasses Chrome entirely — the screenshots are already pixel-perfect.
+// Builds a shared 256-color palette from all pages, then quantizes each page
+// individually before stitching — O(pixels_per_page) not O(total_pixels).
+func stitchImagesPNG(images [][]byte, outputPath string) error {
+	if len(images) == 0 {
+		return fmt.Errorf("no images to stitch")
+	}
+
+	// Phase 1: Decode all pages, collect color samples for a shared palette.
+	type decodedPage struct {
+		img    *image.RGBA
+		bounds image.Rectangle
+	}
+	pages := make([]decodedPage, 0, len(images))
+	totalHeight := 0
+	maxWidth := 0
+	// Sample colors from each page for the shared palette.
+	hist := make(map[[3]uint8]int)
+	for i, raw := range images {
+		src, err := png.Decode(bytes.NewReader(raw))
+		if err != nil {
+			return fmt.Errorf("decoding page %d: %w", i+1, err)
+		}
+		bounds := src.Bounds()
+		totalHeight += bounds.Dy()
+		if bounds.Dx() > maxWidth {
+			maxWidth = bounds.Dx()
+		}
+		// Convert to RGBA for direct pixel access.
+		rgba := image.NewRGBA(bounds)
+		draw.Draw(rgba, bounds, src, bounds.Min, draw.Src)
+		pages = append(pages, decodedPage{img: rgba, bounds: bounds})
+
+		// Sample every 4th pixel for the histogram (fast, representative).
+		pix := rgba.Pix
+		for j := 0; j < len(pix); j += 16 { // 4 bytes/pixel * 4 stride = every 4th pixel
+			hist[[3]uint8{pix[j], pix[j+1], pix[j+2]}]++
+		}
+	}
+
+	// Phase 2: Build shared palette via median-cut on the sampled histogram.
+	palette := medianCutFromHist(hist, 256)
+
+	// Phase 3: Quantize each page to the shared palette and stitch into output.
+	canvas := image.NewPaletted(image.Rect(0, 0, maxWidth, totalHeight), palette)
+	y := 0
+	for _, pg := range pages {
+		dst := image.Rect(0, y, pg.bounds.Dx(), y+pg.bounds.Dy())
+		draw.FloydSteinberg.Draw(canvas, dst, pg.img, pg.bounds.Min)
+		// Free the RGBA page immediately — we don't need it after quantizing.
+		pg.img = nil
+		y += pg.bounds.Dy()
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := png.Encoder{CompressionLevel: png.BestCompression}
+	return enc.Encode(f, canvas)
+}
+
+// medianCutFromHist implements Heckbert (1982) median-cut color quantization.
+// Takes a pre-built histogram map[RGB]count and produces an n-color palette.
+// O(unique_colors * log(n)) — independent of total pixel count.
+func medianCutFromHist(hist map[[3]uint8]int, n int) color.Palette {
+	type entry struct {
+		r, g, b uint8
+		count   int
+	}
+	entries := make([]entry, 0, len(hist))
+	for k, c := range hist {
+		entries = append(entries, entry{k[0], k[1], k[2], c})
+	}
+
+	if len(entries) <= n {
+		palette := make(color.Palette, len(entries))
+		for i, e := range entries {
+			palette[i] = color.RGBA{e.r, e.g, e.b, 255}
+		}
+		return palette
+	}
+
+	type bucket struct {
+		entries []entry
+	}
+
+	bucketRange := func(b *bucket) (int, int) {
+		var minR, minG, minB uint8 = 255, 255, 255
+		var maxR, maxG, maxB uint8 = 0, 0, 0
+		for _, e := range b.entries {
+			if e.r < minR { minR = e.r }
+			if e.r > maxR { maxR = e.r }
+			if e.g < minG { minG = e.g }
+			if e.g > maxG { maxG = e.g }
+			if e.b < minB { minB = e.b }
+			if e.b > maxB { maxB = e.b }
+		}
+		rr := int(maxR) - int(minR)
+		gr := int(maxG) - int(minG)
+		br := int(maxB) - int(minB)
+		if rr >= gr && rr >= br { return 0, rr }
+		if gr >= br { return 1, gr }
+		return 2, br
+	}
+
+	sortBucket := func(b *bucket, ch int) {
+		sort.Slice(b.entries, func(i, j int) bool {
+			switch ch {
+			case 0: return b.entries[i].r < b.entries[j].r
+			case 1: return b.entries[i].g < b.entries[j].g
+			default: return b.entries[i].b < b.entries[j].b
+			}
+		})
+	}
+
+	buckets := []bucket{{entries: entries}}
+	for len(buckets) < n {
+		bestIdx, bestRange, bestChan := 0, 0, 0
+		for i := range buckets {
+			ch, rng := bucketRange(&buckets[i])
+			if rng > bestRange && len(buckets[i].entries) > 1 {
+				bestRange, bestIdx, bestChan = rng, i, ch
+			}
+		}
+		if bestRange == 0 { break }
+
+		b := &buckets[bestIdx]
+		sortBucket(b, bestChan)
+		mid := len(b.entries) / 2
+		left := bucket{entries: b.entries[:mid]}
+		right := bucket{entries: b.entries[mid:]}
+		buckets[bestIdx] = left
+		buckets = append(buckets, right)
+	}
+
+	palette := make(color.Palette, len(buckets))
+	for i, b := range buckets {
+		var rSum, gSum, bSum, total int64
+		for _, e := range b.entries {
+			c := int64(e.count)
+			rSum += int64(e.r) * c
+			gSum += int64(e.g) * c
+			bSum += int64(e.b) * c
+			total += c
+		}
+		if total == 0 { total = 1 }
+		palette[i] = color.RGBA{
+			uint8(rSum / total), uint8(gSum / total), uint8(bSum / total), 255,
+		}
+	}
+	return palette
 }
 
 // openFile opens a file with the system default application.

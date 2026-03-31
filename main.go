@@ -35,6 +35,10 @@ func main() {
 		cmdSnap()
 	case "list", "ls":
 		cmdList()
+	case "shell-init":
+		cmdShellInit()
+	case "shell-status":
+		cmdShellStatus()
 	case "version", "--version", "-v":
 		fmt.Printf("recap %s\n", version)
 	case "help", "--help", "-h":
@@ -133,12 +137,19 @@ func printUsage() {
     recap                 Record a shell session (PTY wrapper)
     recap detect          Detect windows → select → capture → PDF
     recap detect --list   List detected windows with details
-    recap chat            Quick Ghostty capture (all panes, no TUI)
+    recap chat            Quick Ghostty capture (interactive picker if >1 window)
+    recap chat --pane 1   Capture only pane N (1-indexed)
+    recap chat --title X  Target Ghostty window matching title substring
+    recap chat --window-id N  Target exact window ID (from detect --list)
     recap grab            Capture scrollback (tmux/clipboard/file)
     recap grab --edit     Capture → open in nvim → trim → render
     recap pipe            Read from stdin, render as PDF
     recap screen          Screenshot terminal window
     recap screen --pages  Multi-page screenshot → stitched PDF
+
+  Shell Integration:
+    recap shell-init zsh  Output shell hook for eval (zsh/bash/fish)
+    recap shell-status    Show tracked shell sessions
 
   Export:
     recap snap            Export last recorded session
@@ -167,10 +178,23 @@ func printUsage() {
     Ctrl+] then q         Quit recording
     Ctrl+] Ctrl+]         Send literal Ctrl+]
 
+  Detection sources:
+    CGWindowList        All visible windows (any Space, minimized, fullscreen)
+    libproc             Shell processes via proc_listallpids (system-level)
+    AXTabGroup          Terminal tabs via macOS Accessibility API
+    Kitty socket        Direct JSON protocol (PID, CWD, fg process per pane)
+    tmux                All panes across all tmux sessions
+    cmux                All surfaces via cmux socket
+    Shell hook          CWD + last command enrichment (optional)
+
   Ghostty:
     Split panes are detected automatically via Accessibility API.
     Each pane is captured as a separate PDF.
     Requires: System Settings → Privacy & Security → Accessibility
+
+  Kitty:
+    Panes discovered via remote control socket (richest data source).
+    Requires: kitty --listen-on or allow_remote_control in kitty.conf
 
   Cmux:
     Workspaces and surfaces are discovered automatically via socket.
@@ -179,7 +203,7 @@ func printUsage() {
 
   Permissions:
     Screen Recording    Required for window detection and capture
-    Accessibility       Required for Ghostty split pane detection
+    Accessibility       Required for tab and split pane detection
 
   Version: ` + version + `
 
