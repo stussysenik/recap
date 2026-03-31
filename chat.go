@@ -3,11 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
-// cmdChat is a non-interactive shortcut that auto-finds the first Ghostty window
-// and captures all panes without the TUI selector.
+// cmdChat is a quick Ghostty capture with precise window/pane targeting.
+// Flags: --title PATTERN, --window-id N, --pane N, --png, --output PATH
 func cmdChat() {
 	format := "pdf"
 	if hasFlag("--png") {
@@ -28,18 +29,16 @@ func cmdChat() {
 		os.Exit(1)
 	}
 
-	// Find the first Ghostty window
-	var ghosttyWin *WindowInfo
-	for i := range windows {
-		if isGhostty(windows[i].Owner) {
-			ghosttyWin = &windows[i]
-			break
+	// Collect all Ghostty windows.
+	var ghosttyWindows []WindowInfo
+	for _, w := range windows {
+		if isGhostty(w.Owner) {
+			ghosttyWindows = append(ghosttyWindows, w)
 		}
 	}
 
-	if ghosttyWin == nil {
+	if len(ghosttyWindows) == 0 {
 		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m no Ghostty window found\n")
-		// Provide context-specific diagnostics
 		var hasTerminals, hasAnyWindows bool
 		for _, w := range windows {
 			hasAnyWindows = true
@@ -55,15 +54,89 @@ func cmdChat() {
 			fmt.Fprintf(os.Stderr, "  Use \033[1mrecap detect --list\033[0m to see detected windows.\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "  No windows detected at all. Check Screen Recording permission:\n")
-			fmt.Fprintf(os.Stderr, "  System Settings \u2192 Privacy & Security \u2192 Screen Recording\n")
+			fmt.Fprintf(os.Stderr, "  System Settings → Privacy & Security → Screen Recording\n")
 		}
 		os.Exit(1)
 	}
 
+	// Target selection: --window-id > --title > interactive picker > first window.
+	var ghosttyWin *WindowInfo
+
+	if widStr := getFlag("--window-id"); widStr != "" {
+		// Exact window ID targeting (from `recap detect --list` or `recap chat --list`).
+		wid, err := strconv.Atoi(widStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m --window-id must be an integer (got %q)\n", widStr)
+			os.Exit(1)
+		}
+		for i := range ghosttyWindows {
+			if ghosttyWindows[i].ID == wid {
+				ghosttyWin = &ghosttyWindows[i]
+				break
+			}
+		}
+		if ghosttyWin == nil {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m no Ghostty window with ID %d\n", wid)
+			fmt.Fprintf(os.Stderr, "  Available Ghostty windows:\n")
+			for _, w := range ghosttyWindows {
+				fmt.Fprintf(os.Stderr, "    [%d] %s\n", w.ID, w.Label())
+			}
+			os.Exit(1)
+		}
+	} else if titleFilter := getFlag("--title"); titleFilter != "" {
+		// Substring match on window title.
+		for i := range ghosttyWindows {
+			if strings.Contains(strings.ToLower(ghosttyWindows[i].Name), strings.ToLower(titleFilter)) {
+				ghosttyWin = &ghosttyWindows[i]
+				break
+			}
+		}
+		if ghosttyWin == nil {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m no Ghostty window matching --title %q\n", titleFilter)
+			fmt.Fprintf(os.Stderr, "  Available Ghostty windows:\n")
+			for _, w := range ghosttyWindows {
+				fmt.Fprintf(os.Stderr, "    [%d] %s\n", w.ID, w.Label())
+			}
+			os.Exit(1)
+		}
+	} else if len(ghosttyWindows) > 1 {
+		// Multiple Ghostty windows, no filter — interactive picker.
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d Ghostty windows:\n", len(ghosttyWindows))
+		for i, w := range ghosttyWindows {
+			onscreen := ""
+			if !w.OnScreen {
+				onscreen = " \033[90m(other space)\033[0m"
+			}
+			fmt.Fprintf(os.Stderr, "  \033[1m%d)\033[0m %s%s\n", i+1, w.Label(), onscreen)
+		}
+		fmt.Fprintf(os.Stderr, "\n  Select [1-%d]: ", len(ghosttyWindows))
+		var choice string
+		fmt.Scanln(&choice)
+		idx, err := strconv.Atoi(strings.TrimSpace(choice))
+		if err != nil || idx < 1 || idx > len(ghosttyWindows) {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m invalid selection\n")
+			os.Exit(1)
+		}
+		ghosttyWin = &ghosttyWindows[idx-1]
+	} else {
+		// Single Ghostty window — use it directly.
+		ghosttyWin = &ghosttyWindows[0]
+	}
+
 	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found: %s\n", ghosttyWin.Label())
 
-	// Capture all panes (paneIndices=nil means all)
-	paths, err := captureAndRender(*ghosttyWin, format, outputPath, nil)
+	// --pane N: capture only pane N (1-indexed) instead of all.
+	var paneIndices []int
+	if paneStr := getFlag("--pane"); paneStr != "" {
+		paneN, err := strconv.Atoi(paneStr)
+		if err != nil || paneN < 1 {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m --pane must be a positive integer (got %q)\n", paneStr)
+			os.Exit(1)
+		}
+		paneIndices = []int{paneN - 1}
+	}
+
+	paths, err := captureAndRender(*ghosttyWin, format, outputPath, paneIndices)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m %v\n", err)
 		errMsg := err.Error()

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -56,32 +58,191 @@ func cmdDetect() {
 		windows = filtered
 	}
 
-	// Build unified detect items
+	// Discover Kitty panes via socket protocol (richest data source)
+	kittyPanes, kittySock := listKittyPanes()
+	if len(kittyPanes) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d kitty pane(s) via socket\n", len(kittyPanes))
+	}
+
+	// When Kitty panes are found via socket, filter out the opaque Kitty window
+	// from the window list — the socket gives us richer per-pane data.
+	if len(kittyPanes) > 0 {
+		var filtered []WindowInfo
+		for _, w := range windows {
+			if strings.Contains(strings.ToLower(w.Owner), "kitty") {
+				continue
+			}
+			filtered = append(filtered, w)
+		}
+		windows = filtered
+	}
+
+	// Discover shell processes via libproc (system-level process tree)
+	shells, _ := listShellProcesses()
+	if len(shells) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d shell process(es) via libproc\n", len(shells))
+	}
+
+	// Load shell session registry (optional CWD/command enrichment)
+	activeSessions := listActiveSessions()
+	if len(activeSessions) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d tracked shell session(s)\n", len(activeSessions))
+	}
+
+	// Detect terminal tabs via AXTabGroup for non-Ghostty, non-Kitty terminals
+	var tabItems []TabItem
+	for _, w := range windows {
+		if w.Type != AppTerminal {
+			continue
+		}
+		if isGhostty(w.Owner) {
+			continue // Ghostty has its own pane detection
+		}
+		if strings.Contains(strings.ToLower(w.Owner), "kitty") {
+			continue // Kitty uses socket protocol
+		}
+		tabs, _ := detectTabs(w)
+		if len(tabs) > 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d tab(s) in %s\n", len(tabs), w.Owner)
+			for _, tab := range tabs {
+				tabItems = append(tabItems, TabItem{
+					ParentWindow: w,
+					AXTab:        tab,
+				})
+			}
+		}
+	}
+
+	// Build dedup engine: filter shells already accounted for by tmux/cmux/kitty
+	var orphanShells []ShellProc
+	if len(shells) > 0 {
+		// Correlate shells to windows via PPID chain
+		correlated := correlateShellsToWindows(shells, windows)
+		orphans := shellsWithoutWindows(shells, correlated)
+
+		// Filter out shells whose PPID matches a tmux server
+		// (they're already in the tmux pane list)
+		tmuxServerPIDs := findTmuxServerPIDs()
+
+		// Filter out shells managed by Kitty
+		kittyPIDs := make(map[int]bool)
+		for _, kp := range kittyPanes {
+			kittyPIDs[kp.PID] = true
+		}
+
+		for _, s := range orphans {
+			// Skip tmux-managed shells
+			if tmuxServerPIDs[s.PPID] {
+				continue
+			}
+			// Skip Kitty-managed shells
+			if kittyPIDs[s.PID] {
+				continue
+			}
+			orphanShells = append(orphanShells, s)
+		}
+	}
+
+	// --- Build unified detect items with dedup rules ---
 	var items []DetectItem
+
+	// Group: cmux surfaces (highest priority for cmux windows)
 	for i := range cmuxSurfaces {
 		items = append(items, DetectItem{Cmux: &cmuxSurfaces[i]})
 	}
+
+	// Group: Kitty panes (replace opaque Kitty window with per-pane items)
+	for i := range kittyPanes {
+		items = append(items, DetectItem{Kitty: &KittyPaneItem{
+			Pane:       kittyPanes[i],
+			SocketPath: kittySock,
+		}})
+	}
+
+	// Group: Terminal tabs (replace window with individual tab items)
+	// Track which window PIDs have been decomposed into tabs
+	windowsWithTabs := make(map[int]bool)
+	for i := range tabItems {
+		windowsWithTabs[tabItems[i].ParentWindow.PID] = true
+		items = append(items, DetectItem{Tab: &tabItems[i]})
+	}
+
+	// Group: Windows (skip those already decomposed into tabs)
 	for i := range windows {
+		if windowsWithTabs[windows[i].PID] {
+			continue
+		}
 		items = append(items, DetectItem{Window: &windows[i]})
 	}
+
+	// Group: tmux panes
 	for i := range tmuxPanes {
 		items = append(items, DetectItem{Tmux: &tmuxPanes[i]})
 	}
 
+	// Group: Orphan TTY sessions (shells not in any window/tmux/kitty)
+	for i := range orphanShells {
+		sess := findShellSessionForPID(orphanShells[i].PID, activeSessions)
+		items = append(items, DetectItem{TTYShell: &TTYShellItem{
+			Shell:   orphanShells[i],
+			Session: sess,
+		}})
+	}
+
 	if len(items) == 0 {
-		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows or tmux panes found.\n")
+		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No windows, panes, or sessions found.\n")
 		os.Exit(1)
 	}
 
 	// Debug list mode
 	if hasFlag("--list") {
-		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d windows, %d tmux panes, %d cmux surfaces:\n",
-			len(windows), len(tmuxPanes), len(cmuxSurfaces))
 		renderDetectList(windows, tmuxPanes, cmuxSurfaces)
+		// Also list new sources
+		if len(kittyPanes) > 0 {
+			fmt.Printf("  \033[1;93mKitty Panes:\033[0m\n")
+			for _, kp := range kittyPanes {
+				title := kp.Title
+				if title == "" {
+					title = kp.ForegroundProcess()
+				}
+				fmt.Printf("    \033[36m[text]\033[0m kitty: %s \033[90m(%dx%d, PID %d)\033[0m\n",
+					title, kp.Columns, kp.Lines, kp.PID)
+			}
+			fmt.Println()
+		}
+		if len(tabItems) > 0 {
+			fmt.Printf("  \033[1;93mTerminal Tabs:\033[0m\n")
+			for _, t := range tabItems {
+				active := ""
+				if t.AXTab.Active {
+					active = " \033[32m*active\033[0m"
+				}
+				fmt.Printf("    \033[33m[screenshot]\033[0m %s — tab %d: %s%s\n",
+					strings.ToLower(t.ParentWindow.Owner), t.AXTab.Tab+1, t.AXTab.Title, active)
+			}
+			fmt.Println()
+		}
+		if len(orphanShells) > 0 {
+			fmt.Printf("  \033[1;93mTTY Sessions:\033[0m\n")
+			for _, s := range orphanShells {
+				sess := findShellSessionForPID(s.PID, activeSessions)
+				extra := ""
+				if sess != nil && sess.CWD != "" {
+					cwd := sess.CWD
+					if home, err := os.UserHomeDir(); err == nil {
+						cwd = strings.Replace(cwd, home, "~", 1)
+					}
+					extra = fmt.Sprintf(" — %s", cwd)
+				}
+				fmt.Printf("    \033[90m[tty]\033[0m %s (PID %d, %s)%s\n",
+					s.Comm, s.PID, s.TTY, extra)
+			}
+			fmt.Println()
+		}
 		return
 	}
 
-	// Select items (windows + tmux panes)
+	// Select items
 	var selected []DetectItem
 	if hasFlag("--all") || hasFlag("-a") {
 		selected = items
@@ -142,13 +303,24 @@ func cmdDetect() {
 			var err error
 
 			if d.Cmux != nil {
-				// cmux surface: text-based capture via cmux read-screen
 				paths, err = captureAndRenderCmux(*d.Cmux, format, outputPath)
 			} else if d.Tmux != nil {
-				// tmux pane: text-based capture via tmux capture-pane
 				paths, err = captureAndRenderTmux(*d.Tmux, format, outputPath)
-			} else {
-				// Window: screenshot-based capture
+			} else if d.Kitty != nil {
+				paths, err = captureAndRenderKitty(*d.Kitty, format, outputPath)
+			} else if d.Tab != nil {
+				// Tab capture: use parent window's adapter
+				paths, err = captureAndRender(d.Tab.ParentWindow, format, outputPath, nil)
+			} else if d.TTYShell != nil {
+				// TTY shell: if we have a shell session with data, render it
+				// Otherwise skip — we can't capture a TTY we don't control
+				if d.TTYShell.Session != nil {
+					paths, err = captureAndRenderTTY(*d.TTYShell, format, outputPath)
+				} else {
+					err = fmt.Errorf("no shell hook data for %s (PID %d) — install with: eval \"$(recap shell-init %s)\"",
+						d.TTYShell.Shell.Comm, d.TTYShell.Shell.PID, d.TTYShell.Shell.Comm)
+				}
+			} else if d.Window != nil {
 				paths, err = captureAndRender(*d.Window, format, outputPath, paneIndices)
 			}
 
@@ -213,6 +385,61 @@ func captureAndRenderCmux(surface CmuxSurface, format, outputBase string) ([]str
 	return []string{path}, nil
 }
 
+// captureAndRenderKitty runs the full pipeline for a Kitty pane:
+// socket get-text -> ANSI -> HTML -> PDF/PNG.
+func captureAndRenderKitty(pane KittyPaneItem, format, outputBase string) ([]string, error) {
+	adapter := &KittyAdapter{}
+	result, err := adapter.CaptureKittyPane(pane)
+	if err != nil {
+		return nil, err
+	}
+
+	path, err := renderSingle(result, format, outputBase, "")
+	if err != nil {
+		return nil, err
+	}
+	return []string{path}, nil
+}
+
+// captureAndRenderTTY renders a TTY shell session using shell hook data.
+// This is a best-effort capture — we render the session metadata and any
+// last command info as plain text content.
+func captureAndRenderTTY(shell TTYShellItem, format, outputBase string) ([]string, error) {
+	sess := shell.Session
+	if sess == nil {
+		return nil, fmt.Errorf("no shell session data")
+	}
+
+	// Build a text representation of the shell session
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Shell Session: %s (PID %d)\n", shell.Shell.Comm, shell.Shell.PID))
+	sb.WriteString(fmt.Sprintf("TTY: %s\n", shell.Shell.TTY))
+	sb.WriteString(fmt.Sprintf("CWD: %s\n", sess.CWD))
+	if sess.LastCmd != "" {
+		sb.WriteString(fmt.Sprintf("Last Command: %s\n", sess.LastCmd))
+	}
+	sb.WriteString(fmt.Sprintf("Updated: %s\n", sess.UpdatedAt.Format(time.RFC3339)))
+
+	win := WindowInfo{
+		Owner:    shell.Shell.Comm,
+		Name:     fmt.Sprintf("TTY %s — PID %d", shell.Shell.TTY, shell.Shell.PID),
+		OnScreen: true,
+	}
+
+	result := &CaptureResult{
+		Window:      win,
+		ContentType: ContentTextPlain,
+		Data:        []byte(sb.String()),
+		Title:       fmt.Sprintf("%s — %s", shell.Shell.Comm, sess.CWD),
+	}
+
+	path, err := renderSingle(result, format, outputBase, "")
+	if err != nil {
+		return nil, err
+	}
+	return []string{path}, nil
+}
+
 // captureAndRender runs the full pipeline for a single window:
 // capture -> build HTML -> render to PDF/PNG.
 // Returns multiple paths when a window has split panes.
@@ -243,10 +470,36 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 	// Multi-pane: one output per pane
 	var paths []string
 	for _, pane := range result.Panes {
-		var htmlStr string
+		suffix := ""
+		if len(result.Panes) > 1 {
+			suffix = fmt.Sprintf("-pane%d", pane.Index+1)
+		}
 
+		if pane.ContentType == ContentMultiImage && len(pane.Images) > 0 && format == "png" {
+			// Fast path: stitch screenshots directly — no Chrome needed.
+			outPath := outputBase
+			if outPath == "" {
+				home, _ := os.UserHomeDir()
+				ts := time.Now().Format("2006-01-02_15-04-05")
+				safeName := sanitizeFilename(result.Window.Owner)
+				outPath = filepath.Join(home, "Desktop",
+					fmt.Sprintf("recap-%s-%s%s.png", safeName, ts, suffix))
+			} else if suffix != "" {
+				ext := filepath.Ext(outPath)
+				base := strings.TrimSuffix(outPath, ext)
+				outPath = base + suffix + ext
+			}
+			if err := stitchImagesPNG(pane.Images, outPath); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d stitch failed: %v\n", pane.Index+1, err)
+				continue
+			}
+			paths = append(paths, outPath)
+			continue
+		}
+
+		var htmlStr string
 		if pane.ContentType == ContentMultiImage && len(pane.Images) > 0 {
-			// Multi-image scroll-stitch: use dedicated renderer
+			// Multi-image scroll-stitch PDF: use Chrome renderer
 			htmlStr, err = buildMultiImageHTML(pane.Title, pane.Images, pane.SearchText, result.Window)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d render failed: %v\n", pane.Index+1, err)
@@ -268,10 +521,6 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 			}
 		}
 
-		suffix := ""
-		if len(result.Panes) > 1 {
-			suffix = fmt.Sprintf("-pane%d", pane.Index+1)
-		}
 		path, err := renderFromHTML(htmlStr, format, outputBase, suffix, result.Window)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d render failed: %v\n", pane.Index+1, err)
@@ -348,6 +597,26 @@ func renderSingle(result *CaptureResult, format, outputBase, suffix string) (str
 	}
 
 	return outPath, nil
+}
+
+// findTmuxServerPIDs returns a set of PIDs that are tmux server processes.
+// Used to filter shells whose PPID is a tmux server (they're already in tmux list).
+func findTmuxServerPIDs() map[int]bool {
+	result := make(map[int]bool)
+	if !isTmuxAvailable() {
+		return result
+	}
+	// tmux display-message -p '#{pid}' gives the server PID
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "#{pid}").Output()
+	if err == nil {
+		pid := atoi(strings.TrimSpace(string(out)))
+		if pid > 0 {
+			result[pid] = true
+		}
+	}
+	return result
 }
 
 // summarizeWindowTypes returns a comma-separated list of unique non-terminal

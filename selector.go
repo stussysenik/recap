@@ -35,7 +35,7 @@ func runDetectSelector(items []DetectItem, preSelectedIdx int) []DetectItem {
 
 	var entries []entry
 
-	// Group 0: cmux Workspaces
+	// Group: cmux Workspaces
 	var cmuxEntries []int
 	for i, d := range items {
 		if d.Cmux != nil {
@@ -55,7 +55,47 @@ func runDetectSelector(items []DetectItem, preSelectedIdx int) []DetectItem {
 		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
 	}
 
-	// Group 1: tmux Panes
+	// Group: Kitty Panes (via socket protocol)
+	var kittyEntries []int
+	for i, d := range items {
+		if d.Kitty != nil {
+			kittyEntries = append(kittyEntries, i)
+		}
+	}
+	if len(kittyEntries) > 0 {
+		entries = append(entries, entry{itemIdx: -1, label: "Kitty Panes:", isHeader: true})
+		for _, idx := range kittyEntries {
+			kp := items[idx].Kitty
+			label := items[idx].Label() + " \033[36m[text]\033[0m"
+			if kp.Pane.IsActive {
+				label += " \033[32m*active\033[0m"
+			}
+			entries = append(entries, entry{itemIdx: idx, label: label})
+		}
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
+	}
+
+	// Group: Terminal Tabs (via AXTabGroup)
+	var tabEntries []int
+	for i, d := range items {
+		if d.Tab != nil {
+			tabEntries = append(tabEntries, i)
+		}
+	}
+	if len(tabEntries) > 0 {
+		entries = append(entries, entry{itemIdx: -1, label: "Terminal Tabs:", isHeader: true})
+		for _, idx := range tabEntries {
+			tab := items[idx].Tab
+			label := items[idx].Label() + " \033[33m[screenshot]\033[0m"
+			if tab.AXTab.Active {
+				label += " \033[32m*active\033[0m"
+			}
+			entries = append(entries, entry{itemIdx: idx, label: label})
+		}
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
+	}
+
+	// Group: tmux Panes
 	var tmuxEntries []int
 	for i, d := range items {
 		if d.Tmux != nil {
@@ -72,7 +112,7 @@ func runDetectSelector(items []DetectItem, preSelectedIdx int) []DetectItem {
 		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
 	}
 
-	// Group 2-4: Windows by type (Terminals, Browsers, Desktop)
+	// Group: Windows by type (Terminals, Browsers, Desktop)
 	typeOrder := []AppType{AppTerminal, AppBrowser, AppGeneric}
 	for _, t := range typeOrder {
 		var windowsInGroup []int
@@ -95,6 +135,22 @@ func runDetectSelector(items []DetectItem, preSelectedIdx int) []DetectItem {
 			if n, ok := paneCounts[idx]; ok {
 				label = fmt.Sprintf("%s (%d panes)", label, n)
 			}
+			entries = append(entries, entry{itemIdx: idx, label: label})
+		}
+		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
+	}
+
+	// Group: TTY Sessions (orphan shells not in any window)
+	var ttyEntries []int
+	for i, d := range items {
+		if d.TTYShell != nil {
+			ttyEntries = append(ttyEntries, i)
+		}
+	}
+	if len(ttyEntries) > 0 {
+		entries = append(entries, entry{itemIdx: -1, label: "TTY Sessions:", isHeader: true})
+		for _, idx := range ttyEntries {
+			label := items[idx].Label() + " \033[90m[tty]\033[0m"
 			entries = append(entries, entry{itemIdx: idx, label: label})
 		}
 		entries = append(entries, entry{itemIdx: -1, label: "", isHeader: true}) // spacer
