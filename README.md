@@ -8,6 +8,9 @@ capture any terminal â€” windows, tmux panes, cmux workspaces, or raw sessions â
 
 ## quick start
 
+![Demo](demo.gif)
+
+
 ```bash
 git clone https://github.com/stussysenik/recap.git
 cd recap && make install
