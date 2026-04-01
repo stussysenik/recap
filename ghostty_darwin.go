@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -13,9 +14,316 @@ import (
 	"image/png"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// GhosttyTab represents a tab discovered from Ghostty's Window menu.
+type GhosttyTab struct {
+	MenuIndex int    // 1-based index in the Window menu
+	RawName   string // Full name including spinner emoji
+	Name      string // Name with spinner stripped
+}
+
+// stripSpinner removes the leading braille spinner character from Ghostty tab names.
+// Ghostty animates tab titles with braille patterns (U+2800-U+28FF) or ✳ (U+2733).
+func stripSpinner(name string) string {
+	runes := []rune(name)
+	if len(runes) >= 2 && runes[1] == ' ' {
+		first := runes[0]
+		if (first >= 0x2800 && first <= 0x28FF) || first == 0x2733 {
+			return string(runes[2:])
+		}
+	}
+	return name
+}
+
+// listGhosttyTabs enumerates all Ghostty tabs from the Window menu.
+// Uses System Events to read menu items. Tab items appear after the
+// "Arrange in Front" menu item in the Window menu.
+func listGhosttyTabs() ([]GhosttyTab, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// AppleScript that reads ALL Window menu item names in one atomic call,
+	// then returns tab items (after "Arrange in Front") as "index\tname" lines.
+	// Getting all names at once avoids the spinner rotation race condition.
+	script := `
+tell application "System Events"
+	tell process "ghostty"
+		set allNames to name of every menu item of menu "Window" of menu bar 1
+		set c to count of allNames
+		set foundSep to false
+		set output to ""
+		repeat with i from 1 to c
+			set n to item i of allNames as text
+			if n is "Arrange in Front" then
+				set foundSep to true
+			else if foundSep and n is not "missing value" and n is not "" then
+				set output to output & i & "\t" & n & linefeed
+			end if
+		end repeat
+		return output
+	end tell
+end tell
+`
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("list tabs: %w (%s)", err, string(out))
+	}
+
+	var tabs []GhosttyTab
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		idx, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		rawName := parts[1]
+		if rawName == "(unreadable)" || rawName == "missing value" {
+			continue
+		}
+		tabs = append(tabs, GhosttyTab{
+			MenuIndex: idx,
+			RawName:   rawName,
+			Name:      stripSpinner(rawName),
+		})
+	}
+
+	return tabs, nil
+}
+
+// switchGhosttyTab clicks a Ghostty tab by its Window menu index.
+// Uses index-based access to avoid spinner emoji race conditions.
+func switchGhosttyTab(menuIndex int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	script := fmt.Sprintf(`
+tell application "System Events"
+	tell process "ghostty"
+		click menu item %d of menu "Window" of menu bar 1
+	end tell
+end tell
+`, menuIndex)
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("switch tab (index %d): %w (%s)", menuIndex, err, string(out))
+	}
+	return nil
+}
+
+// currentGhosttyTabName returns the name of the currently active Ghostty tab.
+func currentGhosttyTabName() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "osascript", "-e",
+		`tell application "Ghostty" to return name of front window`)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ghosttyConfigPath returns the Ghostty configuration file path on macOS.
+func ghosttyConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "Application Support", "com.mitchellh.ghostty", "config")
+}
+
+// scrollbackKeybindTag is a comment marker so we can identify injected keybindings.
+const scrollbackKeybindTag = "# recap-scrollback-capture (auto-injected, safe to delete)"
+
+// scrollbackKeybind is the keybinding combo used to trigger write_scrollback_file.
+// Uses 4 modifiers to avoid conflicting with any user keybinding.
+const scrollbackKeybind = "super+ctrl+alt+shift+s"
+
+// findExistingKeybinding scans the Ghostty config for an existing binding to the
+// given action. Returns the keybinding string (e.g. "super+shift+s") if found.
+func findExistingKeybinding(configPath, action string) (string, bool) {
+	f, err := os.Open(configPath)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || !strings.Contains(line, "keybind") {
+			continue
+		}
+		// Format: keybind = <key>=<action>
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		val := strings.TrimSpace(parts[1])
+		// val is now "<key>=<action>"
+		kv := strings.SplitN(val, "=", 2)
+		if len(kv) == 2 && strings.TrimSpace(kv[1]) == action {
+			return strings.TrimSpace(kv[0]), true
+		}
+	}
+	return "", false
+}
+
+// injectKeybinding appends a temporary keybinding to the Ghostty config file.
+// Returns a cleanup function that removes the injected line.
+func injectKeybinding(configPath, keybind, action string) (func(), error) {
+	line := fmt.Sprintf("\n%s\nkeybind = %s=%s\n", scrollbackKeybindTag, keybind, action)
+
+	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open config for append: %w", err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("write keybinding: %w", err)
+	}
+	f.Close()
+
+	cleanup := func() {
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			return
+		}
+		// Remove the tag comment and the keybinding line
+		lines := strings.Split(string(data), "\n")
+		var out []string
+		for i := 0; i < len(lines); i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			if trimmed == scrollbackKeybindTag {
+				// Skip this line and the next (the keybinding itself)
+				if i+1 < len(lines) {
+					i++
+				}
+				continue
+			}
+			out = append(out, lines[i])
+		}
+		// Trim trailing empty lines
+		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+			out = out[:len(out)-1]
+		}
+		os.WriteFile(configPath, []byte(strings.Join(out, "\n")+"\n"), 0644)
+	}
+
+	return cleanup, nil
+}
+
+// sendScrollbackKeybindScript sends the 4-modifier+S keybinding via CGEvent.
+const sendScrollbackKeybindScript = `
+import CoreGraphics
+import Foundation
+
+let pid = pid_t(Int32(CommandLine.arguments[1])!)
+
+let src = CGEventSource(stateID: .hidSystemState)
+let down = CGEvent(keyboardEventSource: src, virtualKey: 0x01, keyDown: true)!
+let up = CGEvent(keyboardEventSource: src, virtualKey: 0x01, keyDown: false)!
+let flags: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+down.flags = flags
+up.flags = flags
+down.postToPid(pid)
+up.postToPid(pid)
+`
+
+// extractScrollbackFile uses Ghostty's write_scrollback_file action to extract
+// the full scrollback buffer as text. This works even from the same window because
+// it triggers Ghostty's internal action rather than simulating scroll key events.
+func extractScrollbackFile(w WindowInfo, pane PaneInfo) ([]byte, error) {
+	configPath := ghosttyConfigPath()
+	action := "write_scrollback_file:copy"
+
+	// Check for existing keybinding or inject a temporary one
+	existingBind, found := findExistingKeybinding(configPath, action)
+	if found {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found existing keybinding: %s\n", existingBind)
+	} else {
+		cleanup, err := injectKeybinding(configPath, scrollbackKeybind, action)
+		if err != nil {
+			return nil, fmt.Errorf("inject keybinding: %w", err)
+		}
+		defer cleanup()
+
+		// Wait for Ghostty to live-reload config
+		time.Sleep(600 * time.Millisecond)
+	}
+
+	// Activate window and focus the target pane
+	if err := activateWindow(w.PID); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Window activation failed: %v (continuing)\n", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if pane.Width > 0 && pane.Height > 0 {
+		centerX := w.X + pane.X + pane.Width/2
+		centerY := w.Y + pane.Y + pane.Height/2
+		if err := runClickAt(centerX, centerY); err != nil {
+			return nil, fmt.Errorf("focus pane: %w", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Clear clipboard
+	clearCmd := exec.Command("bash", "-c", "echo -n | pbcopy")
+	clearCmd.Run()
+	time.Sleep(100 * time.Millisecond)
+
+	// Send the keybinding to trigger write_scrollback_file:copy
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "swift", "-e", sendScrollbackKeybindScript,
+		fmt.Sprintf("%d", w.PID))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("send keybinding: %w (%s)", err, string(out))
+	}
+
+	// Poll clipboard for the temp file path
+	var clipContent string
+	for i := 0; i < 20; i++ { // up to 4 seconds
+		time.Sleep(200 * time.Millisecond)
+		out, err := exec.Command("pbpaste").Output()
+		if err != nil {
+			continue
+		}
+		content := strings.TrimSpace(string(out))
+		if content != "" && (strings.HasPrefix(content, "/") && strings.Contains(content, "ghostty")) {
+			clipContent = content
+			break
+		}
+	}
+
+	if clipContent == "" {
+		return nil, fmt.Errorf("clipboard did not receive scrollback file path (timed out)")
+	}
+
+	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scrollback file: %s\n", clipContent)
+
+	// Read the scrollback file
+	data, err := os.ReadFile(clipContent)
+	if err != nil {
+		return nil, fmt.Errorf("read scrollback file %s: %w", clipContent, err)
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("scrollback file is empty")
+	}
+
+	return data, nil
+}
 
 // PaneInfo describes a single pane within a Ghostty split layout.
 // Coordinates are relative to the window's top-left corner.
@@ -330,16 +638,16 @@ case "top":
     // Try Cmd+Home for instant scroll-to-top
     sendKey(0x73, flags: .maskCommand)
     usleep(50000) // 50ms
-    // Also send 500x Shift+PageUp as fallback (Ghostty may not support Cmd+Home)
-    for _ in 0..<500 { sendKey(0x74, flags: .maskShift); usleep(5000) }
+    // Fallback: 50x Cmd+PageUp (Ghostty binds super+page_up to scroll_page_up)
+    for _ in 0..<50 { sendKey(0x74, flags: .maskCommand); usleep(10000) }
 case "pagedown":
-    sendKey(0x79, flags: .maskShift)
+    sendKey(0x79, flags: .maskCommand)
 case "bottom":
     // Try Cmd+End for instant scroll-to-bottom
     sendKey(0x77, flags: .maskCommand)
     usleep(50000) // 50ms
-    // Fallback: 500x Shift+PageDown
-    for _ in 0..<500 { sendKey(0x79, flags: .maskShift); usleep(5000) }
+    // Fallback: 50x Cmd+PageDown (Ghostty binds super+page_down to scroll_page_down)
+    for _ in 0..<50 { sendKey(0x79, flags: .maskCommand); usleep(10000) }
 default:
     break
 }
@@ -409,14 +717,14 @@ if let runningApp = NSRunningApplication(processIdentifier: pid) {
 }
 `
 
-// clickScript sends a mouse click to focus a specific pane via CGEvent.
-const clickScript = `
+// clickScriptTmpl is a Swift snippet for sending a mouse click.
+// The coordinates are interpolated via fmt.Sprintf to avoid negative-number
+// CLI argument issues with `swift -e`.
+const clickScriptTmpl = `
 import CoreGraphics
 import Foundation
 
-let x = Double(CommandLine.arguments[1])!
-let y = Double(CommandLine.arguments[2])!
-let point = CGPoint(x: x, y: y)
+let point = CGPoint(x: %d.0, y: %d.0)
 let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)!
 let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)!
 down.post(tap: .cghidEventTap)
@@ -441,8 +749,8 @@ func runClickAt(x, y int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "swift", "-e", clickScript,
-		fmt.Sprintf("%d", x), fmt.Sprintf("%d", y))
+	script := fmt.Sprintf(clickScriptTmpl, x, y)
+	cmd := exec.CommandContext(ctx, "swift", "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("click failed: %w (%s)", err, string(out))
 	}
@@ -849,6 +1157,9 @@ func scrollStitchCapture(w WindowInfo, pane PaneInfo) ([][]byte, error) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// Overall timeout to prevent hanging
+	deadline := time.Now().Add(60 * time.Second)
+
 	// Capture loop
 	var screenshots [][]byte
 	var prevHash [sha256.Size]byte
@@ -856,6 +1167,13 @@ func scrollStitchCapture(w WindowInfo, pane PaneInfo) ([][]byte, error) {
 	maxPages := 200    // safety limit
 
 	for i := 0; i < maxPages; i++ {
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Scroll capture timed out after 60s (%d pages captured)\n", len(screenshots))
+			break
+		}
+		if i > 0 && (i+1)%5 == 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m   Captured page %d...\n", i+1)
+		}
 		data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
 		if err != nil {
 			if len(screenshots) > 0 {

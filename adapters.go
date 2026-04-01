@@ -243,7 +243,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane detection failed: %v, capturing whole window\n", err)
 	}
 
-	// No splits detected — single pane scroll-stitch capture
+	// No splits detected — single pane capture
 	if len(panes) <= 1 {
 		const titleBarHeight = 28
 		fullPane := PaneInfo{
@@ -254,8 +254,32 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 			Height: w.Height - titleBarHeight,
 		}
 
-		searchText, _ := extractGhosttyText(w, fullPane)
+		// Primary: extract full scrollback via Cmd+A, Cmd+C (select_all + copy_to_clipboard)
+		// This captures the ENTIRE scrollback buffer, not just the visible viewport.
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Extracting terminal text...\n")
+		textData, textErr := extractGhosttyText(w, fullPane)
+		if textErr == nil && len(textData) > 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Captured full scrollback (%d bytes)\n", len(textData))
+			return &CaptureResult{
+				Window:      w,
+				ContentType: ContentTextPlain,
+				Data:        textData,
+				SearchText:  textData,
+				Title:       w.Label(),
+			}, nil
+		}
+		if textErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Text extraction failed: %v\n", textErr)
+		}
 
+		// If active window and text extraction failed, skip scroll-stitch (would hang)
+		if w.IsActive {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Active window — falling back to screenshot\n")
+			return captureWholeWindow(w)
+		}
+
+		// Fallback: scroll-stitch (only for non-active windows)
+		searchText, _ := extractGhosttyText(w, fullPane)
 		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scroll-capturing %s...\n", w.Owner)
 		screenshots, scrollErr := scrollStitchCapture(w, fullPane)
 		if scrollErr == nil && len(screenshots) > 0 {
@@ -297,12 +321,51 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 	// Filter to selected panes if specified
 	targetPanes := filterSelectedPanes(panes, a.SelectedPanes)
 
-	// Multi-pane: scroll-stitch each pane, fallback to screenshot
+	// Multi-pane: try write_scrollback_file per pane, fallback to scroll-stitch/screenshot
 	var captures []PaneCapture
 	var failed int
 	for _, pane := range targetPanes {
+		// Primary: extract full scrollback via Cmd+A, Cmd+C
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: extracting text...\n", pane.Index+1)
+		textData, textErr := extractGhosttyText(w, pane)
+		if textErr == nil && len(textData) > 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: captured scrollback (%d bytes)\n", pane.Index+1, len(textData))
+			captures = append(captures, PaneCapture{
+				Index:       pane.Index,
+				ContentType: ContentTextPlain,
+				Data:        textData,
+				SearchText:  textData,
+				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+			})
+			continue
+		}
+		if textErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d text extraction failed: %v\n", pane.Index+1, textErr)
+		}
+
+		// If active window, skip scroll-stitch
+		if w.IsActive {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d: active window — using screenshot\n", pane.Index+1)
+			screenX := w.X + pane.X
+			screenY := w.Y + pane.Y
+			data, err := screencaptureRegion(screenX, screenY, pane.Width, pane.Height)
+			if err == nil {
+				captures = append(captures, PaneCapture{
+					Index:       pane.Index,
+					ContentType: ContentScreenshot,
+					Data:        data,
+					Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+				})
+			} else {
+				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d capture failed: %v\n", pane.Index+1, err)
+				failed++
+			}
+			continue
+		}
+
 		searchText, _ := extractGhosttyText(w, pane)
 
+		// Fallback: scroll-stitch (non-active windows only)
 		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Scroll-capturing pane %d...\n", pane.Index+1)
 		screenshots, scrollErr := scrollStitchCapture(w, pane)
 		if scrollErr == nil && len(screenshots) > 0 {
