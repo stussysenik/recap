@@ -4,7 +4,7 @@
   └──────────────────────────────────────────────────┘
 ```
 
-capture any terminal — windows, tmux panes, cmux workspaces, or raw sessions — and render them as themed PDFs or optimized PNGs. one binary, no dependencies, works with what you already use.
+capture terminal scrollback, app windows, tmux panes, cmux workspaces, or raw sessions — and render them as themed PDFs or optimized PNGs. one binary, no dependencies, works with what you already use.
 
 ## quick start
 
@@ -16,6 +16,15 @@ git clone https://github.com/stussysenik/recap.git
 cd recap && make install
 recap
 ```
+
+## what's new in v0.5.0
+
+- Ghostty PDFs can now capture exact split scrollback headlessly via `recap chat --title`, `--tab`, and `--active-pane`.
+- `recap detect` now supports direct exact targeting with `--app`, `--title`, `--window-id`, `--active`, and `--active-window`.
+- Zed windows that host a live Codex terminal now export the real transcript top-to-bottom instead of a screenshot of the editor surface.
+- exports default to `~/Downloads`, and `--no-open` keeps background/headless capture flows quiet.
+
+see also: [VISION.md](VISION.md), [PROGRESS.md](PROGRESS.md), and [CHANGELOG.md](CHANGELOG.md).
 
 ## what it captures
 
@@ -31,8 +40,17 @@ recap screen --pages     multi-page screenshot → stitched PDF
 
 **precise targeting**
 ```
+recap chat --title "ipod-classic-anniversary-validation"  fastest exact Ghostty split → searchable PDF
+recap chat --active --active-pane                         fastest focused Ghostty split → searchable PDF
+recap chat --title "ipod-classic-anniversary-validation" --no-open  headless background-friendly Ghostty PDF
+recap chat --tab "validation"                             most stable named Ghostty tab
+recap detect --active-window                             fastest focused app/editor window
+recap detect --app zed --title "settings.json"           exact Zed/editor window
+recap detect --app zed --title "expense-os"              exact Zed/Codex terminal transcript when available
+recap detect --window-id 14995                           exact any-app window ID
 recap chat --pane 1          capture only pane N (1-indexed)
-recap chat --title "project" target Ghostty window matching title
+recap chat --tab "project"   target a named Ghostty tab
+recap chat --title "project" target Ghostty split title first, else window title
 recap chat --window-id 53083 target exact window ID (from detect --list)
 recap chat --png             pixel-perfect PNG with palette quantization
 ```
@@ -75,7 +93,9 @@ Ctrl+] Ctrl+]         send literal Ctrl+]
 
 ## plays nice with
 
-**Ghostty** — split panes detected automatically via Accessibility API. each pane captured separately. precise targeting with `--pane`, `--title`, `--window-id`. interactive picker when multiple windows found.
+**Ghostty** — split panes detected automatically via Accessibility API. on Ghostty 1.3+, PDFs prefer a headless path: `recap` resolves the exact terminal via Ghostty's AppleScript model and exports scrollback without clicking, moving the cursor, or bringing Ghostty to the front. `--title` first tries the current tab's split titles, then falls back to the window title. `--active-pane` targets the focused split in the selected tab. `--tab` is still the most stable selector if you manually name Ghostty tabs.
+
+**Zed / editors / desktop apps** — fastest path is `recap detect --active-window` after focusing the window you want. most precise path is `recap detect --app <name> --title "<substring>"` or `recap detect --window-id <id>` from `recap detect --list`. for terminal windows, `recap` now prefers headless content export before any screenshot fallback. when the selected editor window owns a live Codex terminal, `recap` exports the Codex rollout transcript headlessly instead of screenshotting the editor surface, so `recap detect --app zed --title "expense-os"` produces real terminal content top-to-bottom. other editor terminals still fall back to window capture unless the app exposes its own export path.
 
 **tmux** — all sessions and panes discovered automatically. scrollback captured with full ANSI color sequences preserved.
 
@@ -92,11 +112,16 @@ Ghostty · iTerm2 · Terminal.app · Alacritty · Kitty · WezTerm · any window
 ```
 --png              output PNG instead of PDF
 --output=PATH      custom output path
+--no-open          do not open the rendered file after capture
 --edit, -e         open in $EDITOR before rendering
 --title=TEXT       target window by title / custom header title
+--app=TEXT         target app/window owner by substring
 --window-id=N      target exact window ID
+--active-window    target the focused app window
 --pane=N           capture only pane N (1-indexed)
 ```
+
+default output location is `~/Downloads` unless you pass `--output`.
 
 ## image optimization
 
@@ -125,7 +150,7 @@ make install PREFIX=/usr/local
 
 requires Go 1.21+ and macOS.
 
-> **permissions** — recap needs Screen Recording (for window detection) and Accessibility (for Ghostty split panes). grant in System Settings → Privacy & Security.
+> **permissions** — recap needs Screen Recording (for window detection), Accessibility (for Ghostty split panes), and macOS may prompt once for Automation when `recap` controls Ghostty's AppleScript API. grant in System Settings → Privacy & Security.
 
 ## output
 
@@ -133,4 +158,4 @@ all output uses the **Catppuccin Mocha** color theme — full 256-color and true
 
 ---
 
-v0.4.0 · MIT
+v0.5.0 · MIT

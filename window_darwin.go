@@ -67,50 +67,64 @@ func (w WindowInfo) Label() string {
 // swiftScript uses Swift to call CGWindowListCopyWindowInfo for CGWindowIDs.
 // Uses .optionAll to discover windows across ALL Spaces, minimized, and fullscreen.
 // Swift has direct CoreGraphics access unlike JXA which has bridging issues.
+// We keep distinct windows even when they share a PID because multi-window
+// apps such as Ghostty expose one app PID for many real windows.
 const swiftScript = `
 import CoreGraphics
 import Foundation
 
-// .optionAll finds windows on all Spaces, minimized, and fullscreen
 let allOptions: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+let skip = Set(["dock", "systemuiserver", "control center", "windowmanager", "notification center", "window server",
+                 "autofill", "loginwindow", "open and save panel service", "universalaccessauthwarn",
+                 "bzbmenu", "simulator"])
+
+func shouldInclude(_ w: [String: Any]) -> Bool {
+    let layer = w["kCGWindowLayer"] as? Int ?? 0
+    guard layer == 0 else { return false }
+
+    let owner = w["kCGWindowOwnerName"] as? String ?? ""
+    guard !skip.contains(owner.lowercased()), !owner.isEmpty else { return false }
+
+    let alpha = w["kCGWindowAlpha"] as? Double ?? 1.0
+    guard alpha > 0 else { return false }
+
+    let storeType = w["kCGWindowStoreType"] as? Int ?? 1
+    guard storeType != 0 else { return false }
+
+    let bounds = w["kCGWindowBounds"] as? [String: Any] ?? [:]
+    let width = Int(bounds["Width"] as? Double ?? Double(bounds["Width"] as? Int ?? 0))
+    let height = Int(bounds["Height"] as? Double ?? Double(bounds["Height"] as? Int ?? 0))
+    guard width >= 100, height >= 100 else { return false }
+
+    return true
+}
+
 guard let windowList = CGWindowListCopyWindowInfo(allOptions, kCGNullWindowID) as? [[String: Any]] else {
     print("[]")
     exit(0)
 }
 
-// Also query on-screen-only to know which windows are currently visible
+// Also query on-screen-only to know which windows are currently visible and
+// which concrete window is frontmost.
 let onScreenOptions: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
 let onScreenList = CGWindowListCopyWindowInfo(onScreenOptions, kCGNullWindowID) as? [[String: Any]] ?? []
 var onScreenIDs = Set<Int>()
+var frontWindowID = 0
 for w in onScreenList {
     if let wid = w["kCGWindowNumber"] as? Int { onScreenIDs.insert(wid) }
+    if frontWindowID == 0, shouldInclude(w), let wid = w["kCGWindowNumber"] as? Int {
+        frontWindowID = wid
+    }
 }
 
 var result: [[String: Any]] = []
-let skip = Set(["dock", "systemuiserver", "control center", "windowmanager", "notification center", "window server",
-                 "autofill", "loginwindow", "open and save panel service", "universalaccessauthwarn",
-                 "bzbmenu", "simulator"])
-
 for w in windowList {
-    let layer = w["kCGWindowLayer"] as? Int ?? 0
-    guard layer == 0 else { continue }
-
+    guard shouldInclude(w) else { continue }
     let owner = w["kCGWindowOwnerName"] as? String ?? ""
-    guard !skip.contains(owner.lowercased()), !owner.isEmpty else { continue }
-
-    // Filter out invisible/daemon windows (alpha == 0)
-    let alpha = w["kCGWindowAlpha"] as? Double ?? 1.0
-    guard alpha > 0 else { continue }
-
-    // Filter out windows that are not normal (e.g. utility panels)
-    let storeType = w["kCGWindowStoreType"] as? Int ?? 1
-    guard storeType != 0 else { continue }
 
     let bounds = w["kCGWindowBounds"] as? [String: Any] ?? [:]
     let width = Int(bounds["Width"] as? Double ?? Double(bounds["Width"] as? Int ?? 0))
     let height = Int(bounds["Height"] as? Double ?? Double(bounds["Height"] as? Int ?? 0))
-    guard width >= 100, height >= 100 else { continue }
-
     let windowID = w["kCGWindowNumber"] as? Int ?? 0
 
     result.append([
@@ -122,7 +136,8 @@ for w in windowList {
         "height": height,
         "x": Int(bounds["X"] as? Double ?? 0),
         "y": Int(bounds["Y"] as? Double ?? 0),
-        "onscreen": onScreenIDs.contains(windowID)
+        "onscreen": onScreenIDs.contains(windowID),
+        "is_active": windowID == frontWindowID
     ])
 }
 
@@ -154,46 +169,6 @@ for (var i = 0; i < procs.length; i++) {
 JSON.stringify(result);
 `
 
-// getActivePID returns the PID of the frontmost (active) application.
-// Returns -1 if no frontmost app could be determined.
-func getActivePID() int {
-	script := `import Cocoa
-let workspace = NSWorkspace.shared
-if let app = workspace.frontmostApplication {
-    print(app.processIdentifier)
-} else {
-    print(-1)
-}`
-	cmd := exec.Command("swift", "-")
-	cmd.Stdin = strings.NewReader(script)
-	out, err := cmd.Output()
-	if err != nil {
-		return -1
-	}
-	var pid int
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid)
-	return pid
-}
-
-// getFrontmostAppName returns the name of the frontmost (active) application.
-// Returns empty string if no frontmost app could be determined.
-func getFrontmostAppName() string {
-	script := `import Cocoa
-let workspace = NSWorkspace.shared
-if let app = workspace.frontmostApplication {
-    print(app.localizedName ?? "")
-} else {
-    print("")
-}`
-	cmd := exec.Command("swift", "-")
-	cmd.Stdin = strings.NewReader(script)
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // listWindows enumerates ALL application windows on macOS, including windows
 // on other Spaces, minimized, and fullscreen. Uses Swift for CGWindowIDs
 // (needed for screencapture -l) and System Events for window names.
@@ -218,11 +193,7 @@ func listWindows() ([]WindowInfo, error) {
 		return nil, fmt.Errorf("parsing window list: %w", err)
 	}
 
-	// Step 2: Get frontmost app for active window detection
-	activePID := getActivePID()
-	activeAppName := getFrontmostAppName()
-
-	// Step 3: Enrich with window names from System Events (keyed by PID)
+	// Step 2: Enrich with window names from System Events (keyed by PID)
 	names := getWindowNames()
 	for i := range windows {
 		windows[i].Type = classifyApp(windows[i].Owner)
@@ -234,48 +205,77 @@ func listWindows() ([]WindowInfo, error) {
 				windows[i].Name = n
 			}
 		}
-
-		// Mark frontmost window as active (match by PID or app name)
-		if activePID > 0 && windows[i].PID == activePID {
-			windows[i].IsActive = true
-		} else if activeAppName != "" && strings.EqualFold(windows[i].Owner, activeAppName) {
-			windows[i].IsActive = true
-		}
 	}
 
-	// Step 4: Deduplicate — same PID → keep largest window
+	// Step 3: Deduplicate only exact copies while preserving real multi-window apps.
 	windows = deduplicateWindows(windows)
 
-	// Step 5: Sort — on-screen first, then terminals first
+	// Step 4: Sort — active first, then on-screen, then terminals first.
 	sortWindows(windows)
 
 	return windows, nil
 }
 
-// deduplicateWindows keeps the largest window per PID to avoid showing
-// multiple entries for the same application (e.g. off-screen duplicates).
+// deduplicateWindows removes exact duplicate entries while preserving real
+// multi-window apps that share a PID.
 func deduplicateWindows(windows []WindowInfo) []WindowInfo {
-	best := make(map[int]int) // PID → index of largest window
+	type key struct {
+		PID         int
+		Owner, Name string
+		X, Y, W, H  int
+	}
+
+	score := func(w WindowInfo) int {
+		n := 0
+		if w.Name != "" {
+			n += 4
+		}
+		if w.OnScreen {
+			n += 2
+		}
+		if w.IsActive {
+			n++
+		}
+		return n
+	}
+
+	best := make(map[key]int)
 	for i, w := range windows {
-		area := w.Width * w.Height
-		if existing, ok := best[w.PID]; ok {
-			existingArea := windows[existing].Width * windows[existing].Height
-			if area > existingArea {
-				best[w.PID] = i
+		k := key{
+			PID:   w.PID,
+			Owner: w.Owner,
+			Name:  w.Name,
+			X:     w.X,
+			Y:     w.Y,
+			W:     w.Width,
+			H:     w.Height,
+		}
+		if existing, ok := best[k]; ok {
+			if score(w) > score(windows[existing]) {
+				best[k] = i
 			}
 		} else {
-			best[w.PID] = i
+			best[k] = i
 		}
 	}
 
 	var result []WindowInfo
-	seen := make(map[int]bool)
+	seen := make(map[key]bool)
 	for _, w := range windows {
-		idx := best[w.PID]
-		if seen[w.PID] {
+		k := key{
+			PID:   w.PID,
+			Owner: w.Owner,
+			Name:  w.Name,
+			X:     w.X,
+			Y:     w.Y,
+			W:     w.Width,
+			H:     w.Height,
+		}
+		idx := best[k]
+		if seen[k] {
 			continue
 		}
-		seen[w.PID] = true
+		seen[k] = true
 		result = append(result, windows[idx])
 	}
 	return result
@@ -285,6 +285,10 @@ func deduplicateWindows(windows []WindowInfo) []WindowInfo {
 // browsers before generic apps.
 func sortWindows(windows []WindowInfo) {
 	sort.SliceStable(windows, func(i, j int) bool {
+		// Active window comes first.
+		if windows[i].IsActive != windows[j].IsActive {
+			return windows[i].IsActive
+		}
 		// On-screen windows come first
 		if windows[i].OnScreen != windows[j].OnScreen {
 			return windows[i].OnScreen

@@ -1,5 +1,31 @@
 # recap — Progress Log
 
+## v0.5.0 — Headless Terminal Capture & Semantic Targeting
+
+### Ghostty Headless PDF Capture
+- Added a Ghostty terminal-object capture path via AppleScript
+- `recap` can now resolve the exact selected or focused split and export full scrollback without clicking, focusing, or moving the cursor
+- `recap chat --title`, `--tab`, `--active`, and `--active-pane` now prefer this path for PDF/text capture
+
+### Better Window Identity On macOS
+- Window discovery now preserves distinct windows even when apps share one PID across many surfaces
+- Active-window detection is sourced from real frontmost window ordering, not just app PID matching
+- Shell-to-window correlation now walks through intermediate parent processes like `login`, which fixes Ghostty/Zed mappings
+
+### Terminal-First Capture For Editor Windows
+- `recap detect` gained direct selectors: `--app`, `--title`, `--window-id`, `--active`, and `--active-window`
+- For terminal-backed editor windows, `recap` now tries content export before any screenshot fallback
+- Live Codex sessions inside Zed can now render full searchable transcript PDFs from rollout logs
+
+### Output & Workflow Improvements
+- Default export location is now `~/Downloads` across `chat`, `detect`, `grab`, `pipe`, `record`, and `snap`
+- `--no-open` supports background-friendly/headless jobs without stealing focus after render
+- Help text and README now document the fastest exact Ghostty and Zed capture paths
+
+### Release Notes
+- Version bump to `0.5.0`
+- Added tests for Ghostty terminal matching, window targeting, shell correlation, and Codex transcript rendering
+
 ## v0.4.0 — PNG Optimization & Window Targeting
 
 ### Direct PNG Stitching (Chrome bypass)

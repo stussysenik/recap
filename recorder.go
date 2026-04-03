@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -215,9 +214,8 @@ func (r *Recorder) doSnap(format string) {
 	r.outputFile.Sync()
 	r.session.Save()
 
-	home, _ := os.UserHomeDir()
 	ts := time.Now().Format("2006-01-02_15-04-05")
-	outputPath := filepath.Join(home, "Desktop", fmt.Sprintf("recap-%s.%s", ts, format))
+	outputPath := defaultOutputPath(fmt.Sprintf("recap-%s.%s", ts, format))
 
 	// Notification (raw mode needs \r\n)
 	fmt.Fprintf(os.Stderr, "\r\n\033[90m[recap]\033[0m Exporting %s...\r\n", format)

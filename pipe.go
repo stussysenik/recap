@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 )
 
@@ -68,9 +67,7 @@ func cmdPipe() {
 	}
 
 	if outputPath == "" {
-		home, _ := os.UserHomeDir()
-		outputPath = filepath.Join(home, "Desktop",
-			fmt.Sprintf("recap-%s.%s", sess.ID, format))
+		outputPath = defaultOutputPath(fmt.Sprintf("recap-%s.%s", sess.ID, format))
 	}
 
 	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m %d bytes → %s\n", len(data), format)

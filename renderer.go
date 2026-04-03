@@ -12,10 +12,10 @@ import (
 	"image/draw"
 	"image/png"
 	"os"
-	"sort"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -658,27 +658,46 @@ func medianCutFromHist(hist map[[3]uint8]int, n int) color.Palette {
 		var minR, minG, minB uint8 = 255, 255, 255
 		var maxR, maxG, maxB uint8 = 0, 0, 0
 		for _, e := range b.entries {
-			if e.r < minR { minR = e.r }
-			if e.r > maxR { maxR = e.r }
-			if e.g < minG { minG = e.g }
-			if e.g > maxG { maxG = e.g }
-			if e.b < minB { minB = e.b }
-			if e.b > maxB { maxB = e.b }
+			if e.r < minR {
+				minR = e.r
+			}
+			if e.r > maxR {
+				maxR = e.r
+			}
+			if e.g < minG {
+				minG = e.g
+			}
+			if e.g > maxG {
+				maxG = e.g
+			}
+			if e.b < minB {
+				minB = e.b
+			}
+			if e.b > maxB {
+				maxB = e.b
+			}
 		}
 		rr := int(maxR) - int(minR)
 		gr := int(maxG) - int(minG)
 		br := int(maxB) - int(minB)
-		if rr >= gr && rr >= br { return 0, rr }
-		if gr >= br { return 1, gr }
+		if rr >= gr && rr >= br {
+			return 0, rr
+		}
+		if gr >= br {
+			return 1, gr
+		}
 		return 2, br
 	}
 
 	sortBucket := func(b *bucket, ch int) {
 		sort.Slice(b.entries, func(i, j int) bool {
 			switch ch {
-			case 0: return b.entries[i].r < b.entries[j].r
-			case 1: return b.entries[i].g < b.entries[j].g
-			default: return b.entries[i].b < b.entries[j].b
+			case 0:
+				return b.entries[i].r < b.entries[j].r
+			case 1:
+				return b.entries[i].g < b.entries[j].g
+			default:
+				return b.entries[i].b < b.entries[j].b
 			}
 		})
 	}
@@ -692,7 +711,9 @@ func medianCutFromHist(hist map[[3]uint8]int, n int) color.Palette {
 				bestRange, bestIdx, bestChan = rng, i, ch
 			}
 		}
-		if bestRange == 0 { break }
+		if bestRange == 0 {
+			break
+		}
 
 		b := &buckets[bestIdx]
 		sortBucket(b, bestChan)
@@ -713,7 +734,9 @@ func medianCutFromHist(hist map[[3]uint8]int, n int) color.Palette {
 			bSum += int64(e.b) * c
 			total += c
 		}
-		if total == 0 { total = 1 }
+		if total == 0 {
+			total = 1
+		}
 		palette[i] = color.RGBA{
 			uint8(rSum / total), uint8(gSum / total), uint8(bSum / total), 255,
 		}
@@ -723,6 +746,10 @@ func medianCutFromHist(hist map[[3]uint8]int, n int) color.Palette {
 
 // openFile opens a file with the system default application.
 func openFile(path string) {
+	if hasFlag("--no-open") || os.Getenv("RECAP_NO_OPEN") == "1" {
+		return
+	}
+
 	var cmd string
 	switch runtime.GOOS {
 	case "darwin":

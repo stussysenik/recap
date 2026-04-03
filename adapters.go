@@ -243,6 +243,13 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane detection failed: %v, capturing whole window\n", err)
 	}
 
+	var frontTerms []GhosttyTerminal
+	if isFrontGhosttyWindow(w) {
+		if terms, _, err := listGhosttySelectedTabTerminals(); err == nil && len(terms) > 0 {
+			frontTerms = terms
+		}
+	}
+
 	// No splits detected — single pane capture
 	if len(panes) <= 1 {
 		const titleBarHeight = 28
@@ -254,10 +261,25 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 			Height: w.Height - titleBarHeight,
 		}
 
-		// Primary: extract full scrollback via Cmd+A, Cmd+C (select_all + copy_to_clipboard)
-		// This captures the ENTIRE scrollback buffer, not just the visible viewport.
-		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Extracting terminal text...\n")
-		textData, textErr := extractGhosttyText(w, fullPane)
+		title := w.Label()
+		var textData []byte
+		var textErr error
+
+		if len(frontTerms) == 1 {
+			title = fmt.Sprintf("ghostty — %s", ghosttyTerminalDisplayName(frontTerms[0]))
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Extracting full scrollback via Ghostty terminal helper...\n")
+			textData, textErr = extractGhosttyTerminalScrollback(frontTerms[0])
+		} else {
+			// Fallback for non-front windows or when Ghostty's selected-tab object
+			// model can't be matched to the captured window.
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Extracting full scrollback...\n")
+			textData, textErr = extractScrollbackFile(w, fullPane)
+		}
+		if textErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Scrollback export failed: %v\n", textErr)
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Falling back to Accessibility text...\n")
+			textData, textErr = extractGhosttyText(w, fullPane)
+		}
 		if textErr == nil && len(textData) > 0 {
 			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Captured full scrollback (%d bytes)\n", len(textData))
 			return &CaptureResult{
@@ -265,7 +287,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 				ContentType: ContentTextPlain,
 				Data:        textData,
 				SearchText:  textData,
-				Title:       w.Label(),
+				Title:       title,
 			}, nil
 		}
 		if textErr != nil {
@@ -325,9 +347,24 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 	var captures []PaneCapture
 	var failed int
 	for _, pane := range targetPanes {
-		// Primary: extract full scrollback via Cmd+A, Cmd+C
-		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: extracting text...\n", pane.Index+1)
-		textData, textErr := extractGhosttyText(w, pane)
+		title := fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1)
+		var textData []byte
+		var textErr error
+
+		if len(frontTerms) == len(panes) && pane.Index >= 0 && pane.Index < len(frontTerms) {
+			title = fmt.Sprintf("ghostty — %s", ghosttyTerminalDisplayName(frontTerms[pane.Index]))
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: extracting full scrollback via Ghostty terminal helper...\n", pane.Index+1)
+			textData, textErr = extractGhosttyTerminalScrollback(frontTerms[pane.Index])
+		} else {
+			// Primary: use Ghostty's native scrollback file export.
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: extracting full scrollback...\n", pane.Index+1)
+			textData, textErr = extractScrollbackFile(w, pane)
+		}
+		if textErr != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d scrollback export failed: %v\n", pane.Index+1, textErr)
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: falling back to Accessibility text...\n", pane.Index+1)
+			textData, textErr = extractGhosttyText(w, pane)
+		}
 		if textErr == nil && len(textData) > 0 {
 			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pane %d: captured scrollback (%d bytes)\n", pane.Index+1, len(textData))
 			captures = append(captures, PaneCapture{
@@ -335,7 +372,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 				ContentType: ContentTextPlain,
 				Data:        textData,
 				SearchText:  textData,
-				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+				Title:       title,
 			})
 			continue
 		}
@@ -354,7 +391,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 					Index:       pane.Index,
 					ContentType: ContentScreenshot,
 					Data:        data,
-					Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+					Title:       title,
 				})
 			} else {
 				fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane %d capture failed: %v\n", pane.Index+1, err)
@@ -375,7 +412,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 				ContentType: ContentMultiImage,
 				Images:      screenshots,
 				SearchText:  searchText,
-				Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+				Title:       title,
 			})
 			continue
 		}
@@ -395,7 +432,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 					ContentType: ContentTextPlain,
 					Data:        searchText,
 					SearchText:  searchText,
-					Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+					Title:       title,
 				})
 				continue
 			}
@@ -407,7 +444,7 @@ func (a *GhosttyAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 			ContentType: ContentScreenshot,
 			Data:        data,
 			SearchText:  searchText,
-			Title:       fmt.Sprintf("%s — pane %d", w.Label(), pane.Index+1),
+			Title:       title,
 		})
 	}
 
@@ -489,6 +526,11 @@ func (a *TerminalAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 		// Fall through to screencapture on failure
 	}
 
+	if transcript, err := captureWindowCodexTranscript(w); err == nil {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Exporting Codex terminal transcript from %s\n", w.Label())
+		return transcript, nil
+	}
+
 	return captureWholeWindow(w)
 }
 
@@ -519,6 +561,11 @@ func (a *BrowserAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
 type GenericAdapter struct{}
 
 func (a *GenericAdapter) Capture(w WindowInfo) (*CaptureResult, error) {
+	if transcript, err := captureWindowCodexTranscript(w); err == nil {
+		fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Exporting Codex terminal transcript from %s\n", w.Label())
+		return transcript, nil
+	}
+
 	return captureWholeWindow(w)
 }
 

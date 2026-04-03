@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -130,51 +132,66 @@ func listShellProcesses() ([]ShellProc, error) {
 // chain like: zsh(5678) → login(5677) → iTerm2(1234). We walk until
 // we hit a known window PID or exhaust the chain.
 func correlateShellsToWindows(shells []ShellProc, windows []WindowInfo) map[int][]ShellProc {
+	parentMap := listProcessParents()
+	if len(parentMap) == 0 {
+		parentMap = make(map[int]int, len(shells))
+		for _, s := range shells {
+			parentMap[s.PID] = s.PPID
+		}
+	}
+	return correlateShellsToWindowsWithParents(shells, windows, parentMap)
+}
+
+func correlateShellsToWindowsWithParents(shells []ShellProc, windows []WindowInfo, parentMap map[int]int) map[int][]ShellProc {
 	// Build a set of window PIDs for O(1) lookup
 	windowPIDs := make(map[int]bool, len(windows))
 	for _, w := range windows {
 		windowPIDs[w.PID] = true
 	}
 
-	// Build a PPID lookup from the shell list itself (for walking intermediate processes)
-	ppidMap := make(map[int]int, len(shells))
-	for _, s := range shells {
-		ppidMap[s.PID] = s.PPID
-	}
-
 	result := make(map[int][]ShellProc)
 
 	for _, shell := range shells {
-		// Walk the PPID chain: shell → parent → grandparent → ...
-		// Stop when we find a window PID or after 20 hops (safety limit)
 		pid := shell.PPID
-		for hops := 0; hops < 20; hops++ {
+		for hops := 0; hops < 40 && pid > 1; hops++ {
 			if windowPIDs[pid] {
 				result[pid] = append(result[pid], shell)
 				break
 			}
-			// Try to find this PID's parent in our process list
-			if parent, ok := ppidMap[pid]; ok && parent > 1 {
-				pid = parent
-				continue
-			}
-			// Not in our list — try the shell list as a whole
-			// (the parent might not be a shell but we still recorded it)
-			found := false
-			for _, s := range shells {
-				if s.PID == pid {
-					pid = s.PPID
-					found = true
-					break
-				}
-			}
-			if !found {
+			parent, ok := parentMap[pid]
+			if !ok || parent <= 0 || parent == pid {
 				break
 			}
+			pid = parent
 		}
 	}
 
 	return result
+}
+
+// listProcessParents builds a full PID -> PPID map so shell correlation can
+// walk through non-shell processes such as login helpers.
+func listProcessParents() map[int]int {
+	cmd := exec.Command("ps", "-axo", "pid=,ppid=")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	parents := make(map[int]int)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		parents[pid] = ppid
+	}
+	return parents
 }
 
 // shellsWithoutWindows returns shells that couldn't be correlated to any

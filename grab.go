@@ -85,9 +85,7 @@ func cmdGrab() {
 	}
 
 	if outputPath == "" {
-		home, _ := os.UserHomeDir()
-		outputPath = filepath.Join(home, "Desktop",
-			fmt.Sprintf("recap-%s.%s", sess.ID, format))
+		outputPath = defaultOutputPath(fmt.Sprintf("recap-%s.%s", sess.ID, format))
 	}
 
 	fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Rendering %s...\n", format)
@@ -143,7 +141,6 @@ func grabScreen(outputPath string) error {
 }
 
 func cmdScreen() {
-	home, _ := os.UserHomeDir()
 	ts := time.Now().Format("2006-01-02_15-04-05")
 
 	if hasFlag("--pages") {
@@ -157,7 +154,7 @@ func cmdScreen() {
 		outputPath = getFlag("-o")
 	}
 	if outputPath == "" {
-		outputPath = filepath.Join(home, "Desktop", fmt.Sprintf("recap-screen-%s.png", ts))
+		outputPath = defaultOutputPath(fmt.Sprintf("recap-screen-%s.png", ts))
 	}
 
 	if err := grabScreen(outputPath); err != nil {
@@ -176,7 +173,6 @@ func cmdScreen() {
 }
 
 func cmdScreenPages() {
-	home, _ := os.UserHomeDir()
 	ts := time.Now().Format("2006-01-02_15-04-05")
 	tmpDir, err := os.MkdirTemp("", "recap-pages-*")
 	if err != nil {
@@ -250,8 +246,7 @@ func cmdScreenPages() {
 		outputPath = getFlag("-o")
 	}
 	if outputPath == "" {
-		outputPath = filepath.Join(home, "Desktop",
-			fmt.Sprintf("recap-pages-%s.%s", ts, format))
+		outputPath = defaultOutputPath(fmt.Sprintf("recap-pages-%s.%s", ts, format))
 	}
 
 	// Build stitched HTML from all page images

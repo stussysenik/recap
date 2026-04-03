@@ -244,7 +244,14 @@ func cmdDetect() {
 
 	// Select items
 	var selected []DetectItem
-	if hasFlag("--all") || hasFlag("-a") {
+	preSelected, err := selectDetectItemsByFlags(items)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m %v\n", err)
+		os.Exit(1)
+	}
+	if len(preSelected) > 0 {
+		selected = preSelected
+	} else if hasFlag("--all") || hasFlag("-a") {
 		selected = items
 	} else {
 		// Find active item for pre-selection
@@ -253,7 +260,15 @@ func cmdDetect() {
 			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Pre-selected: %s\n",
 				items[activeIdx].Label())
 		}
-		selected = runDetectSelector(items, activeIdx)
+		if hasFlag("--active") {
+			if activeIdx < 0 {
+				fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m no active target found\n")
+				os.Exit(1)
+			}
+			selected = []DetectItem{items[activeIdx]}
+		} else {
+			selected = runDetectSelector(items, activeIdx)
+		}
 	}
 	if len(selected) == 0 {
 		fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m No items selected\n")
@@ -270,7 +285,21 @@ func cmdDetect() {
 			panes, _ := detectGhosttyPanes(*item.Window)
 			if len(panes) > 1 {
 				fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Found %d panes in %s\n", len(panes), item.Window.Label())
-				selectedPanes := runPaneSelector(*item.Window, panes, -1) // No pre-selection for panes yet
+				preSelectedPane := -1
+				if hasFlag("--active-pane") {
+					paneIdx, err := detectActiveGhosttyPane(*item.Window)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m active pane detection failed: %v\n", err)
+					} else if paneIdx >= 0 {
+						preSelectedPane = paneIdx
+						fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Focused pane: %d\n", paneIdx+1)
+					}
+				}
+				if hasFlag("--active") && preSelectedPane >= 0 {
+					paneSelections[i] = []int{preSelectedPane}
+					continue
+				}
+				selectedPanes := runPaneSelector(*item.Window, panes, preSelectedPane)
 				if selectedPanes == nil {
 					fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m Pane selection cancelled for %s\n", item.Window.Label())
 					continue
@@ -479,11 +508,9 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 			// Fast path: stitch screenshots directly — no Chrome needed.
 			outPath := outputBase
 			if outPath == "" {
-				home, _ := os.UserHomeDir()
 				ts := time.Now().Format("2006-01-02_15-04-05")
 				safeName := sanitizeFilename(result.Window.Owner)
-				outPath = filepath.Join(home, "Desktop",
-					fmt.Sprintf("recap-%s-%s%s.png", safeName, ts, suffix))
+				outPath = defaultOutputPath(fmt.Sprintf("recap-%s-%s%s.png", safeName, ts, suffix))
 			} else if suffix != "" {
 				ext := filepath.Ext(outPath)
 				base := strings.TrimSuffix(outPath, ext)
@@ -539,11 +566,9 @@ func captureAndRender(w WindowInfo, format, outputBase string, paneIndices []int
 func renderFromHTML(htmlStr, format, outputBase, suffix string, w WindowInfo) (string, error) {
 	outPath := outputBase
 	if outPath == "" {
-		home, _ := os.UserHomeDir()
 		ts := time.Now().Format("2006-01-02_15-04-05")
 		safeName := sanitizeFilename(w.Owner)
-		outPath = filepath.Join(home, "Desktop",
-			fmt.Sprintf("recap-%s-%s%s.%s", safeName, ts, suffix, format))
+		outPath = defaultOutputPath(fmt.Sprintf("recap-%s-%s%s.%s", safeName, ts, suffix, format))
 	} else if suffix != "" {
 		ext := filepath.Ext(outPath)
 		base := strings.TrimSuffix(outPath, ext)
@@ -574,11 +599,9 @@ func renderSingle(result *CaptureResult, format, outputBase, suffix string) (str
 	// Determine output path
 	outPath := outputBase
 	if outPath == "" {
-		home, _ := os.UserHomeDir()
 		ts := time.Now().Format("2006-01-02_15-04-05")
 		safeName := sanitizeFilename(result.Window.Owner)
-		outPath = filepath.Join(home, "Desktop",
-			fmt.Sprintf("recap-%s-%s%s.%s", safeName, ts, suffix, format))
+		outPath = defaultOutputPath(fmt.Sprintf("recap-%s-%s%s.%s", safeName, ts, suffix, format))
 	} else if suffix != "" {
 		// Insert suffix before extension in explicit output path
 		ext := filepath.Ext(outPath)
@@ -672,6 +695,94 @@ func findActiveItem(items []DetectItem) int {
 	}
 
 	return -1 // no active item found
+}
+
+// selectDetectItemsByFlags resolves direct-selection flags for `recap detect`.
+// Returns nil, nil when no direct-selection flags were provided.
+func selectDetectItemsByFlags(items []DetectItem) ([]DetectItem, error) {
+	if widStr := getFlag("--window-id"); widStr != "" {
+		wid := atoi(widStr)
+		if wid <= 0 {
+			return nil, fmt.Errorf("--window-id must be a positive integer (got %q)", widStr)
+		}
+		for _, item := range items {
+			if item.Window != nil && item.Window.ID == wid {
+				return []DetectItem{item}, nil
+			}
+		}
+		return nil, fmt.Errorf("no window matching --window-id %d", wid)
+	}
+
+	titleFilter := strings.TrimSpace(getFlag("--title"))
+	appFilter := strings.TrimSpace(getFlag("--app"))
+	activeWindow := hasFlag("--active-window")
+
+	var candidates []DetectItem
+	if titleFilter != "" || appFilter != "" || activeWindow {
+		candidates = filterWindowItems(items, appFilter, titleFilter)
+	} else {
+		return nil, nil
+	}
+
+	if activeWindow {
+		for _, item := range candidates {
+			if item.Window != nil && item.Window.IsActive {
+				return []DetectItem{item}, nil
+			}
+		}
+		return nil, fmt.Errorf("no active window matched%s", describeDetectWindowFilters(appFilter, titleFilter))
+	}
+
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no window matched%s", describeDetectWindowFilters(appFilter, titleFilter))
+	}
+	if len(candidates) == 1 {
+		return candidates, nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "multiple windows matched%s:\n", describeDetectWindowFilters(appFilter, titleFilter))
+	for _, item := range candidates {
+		if item.Window == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "  [%d] %s\n", item.Window.ID, item.Window.Label())
+	}
+	b.WriteString("use --window-id for an exact match")
+	return nil, fmt.Errorf("%s", strings.TrimSpace(b.String()))
+}
+
+func filterWindowItems(items []DetectItem, appFilter, titleFilter string) []DetectItem {
+	appFilter = strings.ToLower(strings.TrimSpace(appFilter))
+	titleFilter = strings.ToLower(strings.TrimSpace(titleFilter))
+
+	var result []DetectItem
+	for _, item := range items {
+		if item.Window == nil {
+			continue
+		}
+		if appFilter != "" && !strings.Contains(strings.ToLower(item.Window.Owner), appFilter) {
+			continue
+		}
+		if titleFilter != "" && !strings.Contains(strings.ToLower(item.Window.Name), titleFilter) {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func describeDetectWindowFilters(appFilter, titleFilter string) string {
+	switch {
+	case appFilter != "" && titleFilter != "":
+		return fmt.Sprintf(" for --app %q and --title %q", appFilter, titleFilter)
+	case appFilter != "":
+		return fmt.Sprintf(" for --app %q", appFilter)
+	case titleFilter != "":
+		return fmt.Sprintf(" for --title %q", titleFilter)
+	default:
+		return ""
+	}
 }
 
 // sanitizeFilename makes a string safe for use in filenames.

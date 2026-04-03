@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const version = "0.3.1"
+const version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -75,8 +75,7 @@ func cmdSnap() {
 
 	if outputPath == "" {
 		ext := format
-		home, _ := os.UserHomeDir()
-		outputPath = fmt.Sprintf("%s/Desktop/recap-%s.%s", home, sess.ID, ext)
+		outputPath = defaultOutputPath(fmt.Sprintf("recap-%s.%s", sess.ID, ext))
 	}
 
 	fmt.Printf("\033[90m[recap]\033[0m Exporting session \033[1m%s\033[0m...\n", sess.ID)
@@ -137,9 +136,17 @@ func printUsage() {
     recap                 Record a shell session (PTY wrapper)
     recap detect          Detect windows → select → capture → PDF
     recap detect --list   List detected windows with details
+    recap detect --active Capture the active target directly
+    recap detect --active-window Capture the focused app window directly
+    recap detect --app zed --title X Capture an exact editor/app window; terminal windows prefer transcript/scrollback first
+    recap detect --window-id N Capture an exact app window by ID
     recap chat            Quick Ghostty capture (interactive picker if >1 window)
+    recap chat --active   Capture the focused Ghostty window
+    recap chat --active-pane Capture only the focused Ghostty split (headless PDF path)
+    recap chat --tab X    Capture a named Ghostty tab (stable manual title)
+    recap chat --tab-list List Ghostty tabs as recap sees them
     recap chat --pane 1   Capture only pane N (1-indexed)
-    recap chat --title X  Target Ghostty window matching title substring
+    recap chat --title X  Target Ghostty split title first, else window title
     recap chat --window-id N  Target exact window ID (from detect --list)
     recap grab            Capture scrollback (tmux/clipboard/file)
     recap grab --edit     Capture → open in nvim → trim → render
@@ -169,8 +176,14 @@ func printUsage() {
   Global flags:
     --png                 Output PNG instead of PDF
     --output=PATH         Custom output path
+    --no-open             Do not open Preview/browser after rendering
     --edit, -e            Open in $EDITOR before rendering
     --title=TEXT          Custom header title
+    --active              Use the active target (cmux/tmux/window) without prompting
+    --active-window       Use the focused app window without prompting
+    --active-pane         For Ghostty, prefer the focused split pane
+    --app=TEXT            Match app/window owner by substring
+    --window-id=N         Target an exact macOS window ID
 
   In-session shortcuts (during recap record):
     Ctrl+] then s         Snap → PDF
@@ -186,11 +199,17 @@ func printUsage() {
     tmux                All panes across all tmux sessions
     cmux                All surfaces via cmux socket
     Shell hook          CWD + last command enrichment (optional)
+    Codex rollout       Headless transcript export for windows backed by a live Codex terminal
+
+  Terminal windows:
+    recap prefers text/scrollback export before falling back to a screenshot.
+    Editor windows with live Codex terminals can render full transcript PDFs top-to-bottom.
 
   Ghostty:
     Split panes are detected automatically via Accessibility API.
-    Each pane is captured as a separate PDF.
-    Requires: System Settings → Privacy & Security → Accessibility
+    PDFs prefer headless terminal-object capture on Ghostty 1.3+.
+    --title can target a split title in the selected tab.
+    Requires: Accessibility, and Automation for Ghostty on first AppleScript use
 
   Kitty:
     Panes discovered via remote control socket (richest data source).

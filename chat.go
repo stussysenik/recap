@@ -3,14 +3,14 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // cmdChat is a quick Ghostty capture with precise window/pane targeting.
-// Flags: --title PATTERN, --window-id N, --pane N, --tab NAME, --tab-list, --png, --output PATH
+// Flags: --title PATTERN, --window-id N, --pane N, --active, --active-pane,
+// --tab NAME, --tab-list, --png, --output PATH
 func cmdChat() {
 	format := "pdf"
 	if hasFlag("--png") {
@@ -20,6 +20,7 @@ func cmdChat() {
 	if outputPath == "" {
 		outputPath = getFlag("-o")
 	}
+	titleFilter := strings.TrimSpace(getFlag("--title"))
 
 	// --tab-list: print all Ghostty tabs and exit
 	if hasFlag("--tab-list") {
@@ -101,6 +102,57 @@ func cmdChat() {
 		defer tabSwitchBack()
 	}
 
+	// Headless PDF/text-first fast paths. When a specific Ghostty terminal can be
+	// resolved directly, capture it without activating the app or simulating input.
+	if getFlag("--window-id") == "" && getFlag("--pane") == "" {
+		if hasFlag("--active-pane") {
+			term, windowTitle, err := frontGhosttyFocusedTerminal()
+			if err == nil && term != nil {
+				fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Headless capture: focused Ghostty terminal %q\n", ghosttyTerminalDisplayName(*term))
+				paths, err := captureAndRenderGhosttyTerminal(*term, windowTitle, format, outputPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m %v\n", err)
+					os.Exit(1)
+				}
+				for _, path := range paths {
+					fmt.Fprintf(os.Stderr, "\033[32m✓\033[0m %s\n", path)
+					openFile(path)
+				}
+				return
+			}
+		}
+
+		if titleFilter != "" {
+			terminals, windowTitle, err := listGhosttySelectedTabTerminals()
+			if err == nil {
+				matches := findGhosttyTerminalMatches(terminals, titleFilter)
+				switch len(matches) {
+				case 1:
+					fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Headless capture: Ghostty terminal %q\n", ghosttyTerminalDisplayName(matches[0]))
+					paths, err := captureAndRenderGhosttyTerminal(matches[0], windowTitle, format, outputPath)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m %v\n", err)
+						os.Exit(1)
+					}
+					for _, path := range paths {
+						fmt.Fprintf(os.Stderr, "\033[32m✓\033[0m %s\n", path)
+						openFile(path)
+					}
+					return
+				case 0:
+					// Fall through to window-title matching below.
+				default:
+					fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m multiple Ghostty terminals matched --title %q\n", titleFilter)
+					for _, term := range matches {
+						fmt.Fprintf(os.Stderr, "  [%s] %s\n", term.ID, ghosttyTerminalDisplayName(term))
+					}
+					fmt.Fprintf(os.Stderr, "  Narrow the title or use --active-pane after switching focus inside Ghostty.\n")
+					os.Exit(1)
+				}
+			}
+		}
+	}
+
 	// Fast path: when --window-id is provided, capture directly via screencapture -l
 	// without needing listWindows() (which requires CGWindowListCopyWindowInfo permission).
 	if widStr := getFlag("--window-id"); widStr != "" {
@@ -164,10 +216,8 @@ func cmdChat() {
 		}
 		outPath := outputPath
 		if outPath == "" {
-			home, _ := os.UserHomeDir()
 			ts := time.Now().Format("2006-01-02_15-04-05")
-			outPath = filepath.Join(home, "Desktop",
-				fmt.Sprintf("recap-ghostty-%s.%s", ts, format))
+			outPath = defaultOutputPath(fmt.Sprintf("recap-ghostty-%s.%s", ts, format))
 		}
 		path, err := renderSingle(result, format, outPath, "")
 		if err != nil {
@@ -219,10 +269,21 @@ func cmdChat() {
 		os.Exit(1)
 	}
 
-	// Target selection: --title > interactive picker > first window.
+	// Target selection: --active > --title > interactive picker > first window.
 	var ghosttyWin *WindowInfo
 
-	if titleFilter := getFlag("--title"); titleFilter != "" {
+	if hasFlag("--active") {
+		for i := range ghosttyWindows {
+			if ghosttyWindows[i].IsActive {
+				ghosttyWin = &ghosttyWindows[i]
+				break
+			}
+		}
+		if ghosttyWin == nil {
+			fmt.Fprintf(os.Stderr, "\033[31merror:\033[0m no active Ghostty window found\n")
+			os.Exit(1)
+		}
+	} else if titleFilter != "" {
 		// Substring match on window title.
 		for i := range ghosttyWindows {
 			if strings.Contains(strings.ToLower(ghosttyWindows[i].Name), strings.ToLower(titleFilter)) {
@@ -273,6 +334,14 @@ func cmdChat() {
 			os.Exit(1)
 		}
 		paneIndices = []int{paneN - 1}
+	} else if hasFlag("--active-pane") {
+		paneIdx, err := detectActiveGhosttyPane(*ghosttyWin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[33m[recap]\033[0m active pane detection failed: %v\n", err)
+		} else if paneIdx >= 0 {
+			fmt.Fprintf(os.Stderr, "\033[90m[recap]\033[0m Focused pane: %d\n", paneIdx+1)
+			paneIndices = []int{paneIdx}
+		}
 	}
 
 	paths, err := captureAndRender(*ghosttyWin, format, outputPath, paneIndices)

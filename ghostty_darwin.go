@@ -554,6 +554,105 @@ func countGhosttyPanes(w WindowInfo) int {
 	return len(panes)
 }
 
+type ghosttyFocusedFrame struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+const axFocusedPaneScript = `
+import Cocoa
+
+let pid = Int32(CommandLine.arguments[1])!
+let app = AXUIElementCreateApplication(pid)
+
+func getFrame(_ el: AXUIElement) -> (x: Int, y: Int, w: Int, h: Int)? {
+    var posRef: CFTypeRef?
+    var sizeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posRef) == .success,
+          AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeRef) == .success,
+          let pos = posRef as? AXValue,
+          let size = sizeRef as? AXValue else {
+        return nil
+    }
+
+    var point = CGPoint.zero
+    var rectSize = CGSize.zero
+    AXValueGetValue(pos, .cgPoint, &point)
+    AXValueGetValue(size, .cgSize, &rectSize)
+    return (Int(point.x), Int(point.y), Int(rectSize.width), Int(rectSize.height))
+}
+
+var windowRef: CFTypeRef?
+guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef) == .success,
+      let window = windowRef as? AXUIElement,
+      let windowFrame = getFrame(window) else {
+    print("{}")
+    exit(0)
+}
+
+var focusedRef: CFTypeRef?
+guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+      let focused = focusedRef as? AXUIElement,
+      let frame = getFrame(focused) else {
+    print("{}")
+    exit(0)
+}
+
+let result: [String: Int] = [
+    "x": frame.x - windowFrame.x,
+    "y": frame.y - windowFrame.y,
+    "width": frame.w,
+    "height": frame.h,
+]
+let json = try! JSONSerialization.data(withJSONObject: result, options: [])
+print(String(data: json, encoding: .utf8)!)
+`
+
+// detectActiveGhosttyPane returns the focused Ghostty split index.
+// Returns -1 when focus can't be resolved or the window is not split.
+func detectActiveGhosttyPane(w WindowInfo) (int, error) {
+	panes, err := detectGhosttyPanes(w)
+	if err != nil {
+		return -1, err
+	}
+	if len(panes) <= 1 {
+		return -1, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "swift", "-e", axFocusedPaneScript, fmt.Sprintf("%d", w.PID))
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return -1, fmt.Errorf("focused pane detection timed out (5s)")
+		}
+		return -1, err
+	}
+
+	var frame ghosttyFocusedFrame
+	if err := json.Unmarshal(out, &frame); err != nil {
+		return -1, err
+	}
+	if frame.Width <= 0 || frame.Height <= 0 {
+		return -1, nil
+	}
+
+	cx := frame.X + frame.Width/2
+	cy := frame.Y + frame.Height/2
+	for _, pane := range panes {
+		if cx >= pane.X && cx < pane.X+pane.Width &&
+			cy >= pane.Y && cy < pane.Y+pane.Height {
+			return pane.Index, nil
+		}
+	}
+
+	return -1, nil
+}
+
 // copyScript uses Cmd+A (select all) + Cmd+C (copy) via CGEvent to extract
 // terminal text from a Ghostty window through the macOS clipboard.
 // It saves and restores the previous clipboard content.
@@ -656,6 +755,10 @@ default:
 // extractGhosttyText extracts terminal text from a Ghostty window using
 // clipboard-based extraction (Cmd+A, Cmd+C). Returns the text content.
 func extractGhosttyText(w WindowInfo, pane PaneInfo) ([]byte, error) {
+	if data, err := extractGhosttyAXText(w, pane); err == nil && len(data) > 0 {
+		return data, nil
+	}
+
 	// Activate window so key events reach it
 	if err := activateWindow(w.PID); err != nil {
 		return nil, fmt.Errorf("activate window: %w", err)
